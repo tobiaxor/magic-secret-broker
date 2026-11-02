@@ -94,6 +94,7 @@ THEMES = {
     "forget": {"accent": "#ea580c", "hover": "#c2410c", "tint": "#fff7ed", "soft": "#fed7aa", "icon": ""},
     "store": {"accent": "#059669", "hover": "#047857", "tint": "#ecfdf5", "soft": "#a7f3d0", "icon": ""},
     "ask": {"accent": "#7c3aed", "hover": "#6d28d9", "tint": "#f5f3ff", "soft": "#ddd6fe", "icon": ""},
+    "delete": {"accent": "#b91c1c", "hover": "#991b1b", "tint": "#fef2f2", "soft": "#fecaca", "icon": ""},
 }
 BG = "#ffffff"
 FOOTER_BG = "#f8fafc"
@@ -474,12 +475,18 @@ def dialog_password(vault: str, error: str, project: str | None = None) -> dict:
     return result
 
 
-def dialog_mode(scope: str, project: str | None) -> bool:
+def dialog_mode(scope: str, project: str | None, write: bool = False) -> bool:
     result = {"ok": False}
-    d = _Dialog("forget", tr("Secret broker — notify-only mode"), tr("Turn on notify-only mode?"), "secret-broker mode notify", project)
-    d.section(tr("WHAT HAPPENS"))
-    d.note(tr("In {scope}, secrets without a standing approval will be released to the agent without a window; "
-              "you only get a notification.", scope=scope))
+    if write:
+        d = _Dialog("forget", tr("Secret broker — notify-only mode"), tr("Save without asking?"), "secret-broker mode notify --write", project)
+        d.section(tr("WHAT HAPPENS"))
+        d.note(tr("In {scope}, the agent will create and overwrite vault entries without a window; you only get a notification. "
+                  "Overwritten values stay in the entry's KeePass history.", scope=scope))
+    else:
+        d = _Dialog("forget", tr("Secret broker — notify-only mode"), tr("Turn on notify-only mode?"), "secret-broker mode notify", project)
+        d.section(tr("WHAT HAPPENS"))
+        d.note(tr("In {scope}, secrets without a standing approval will be released to the agent without a window; "
+                  "you only get a notification.", scope=scope))
     d.tk.Label(d.body, text=tr("This was requested from the command line, possibly by an agent."), font=(FONT, 9), bg=BG,
                fg=MUTED).pack(anchor="w", pady=(d.px(4), 0))
 
@@ -517,6 +524,32 @@ def dialog_forget(vault: str, project: str, reason: str) -> tuple[bool, str]:
     d.root.bind("<Escape>", lambda _e: pick(False))
     d.root.protocol("WM_DELETE_WINDOW", lambda: pick(False))
     d.arm_after_delay(forget)
+    d.run(cancel)
+    return result["ok"], "" if result["ok"] else comment.get().strip()
+
+
+def dialog_delete(secret: str, fields: list[str], project: str, reason: str) -> tuple[bool, str]:
+    result = {"ok": False}
+    d = _Dialog("delete", tr("Secret broker — delete a secret"), tr("The agent wants to delete a secret"), "secret-broker delete", project)
+
+    d.section(tr("ENTRY"))
+    d.tk.Label(d.body, text=secret, font=(FONT, 11, "bold"), bg=BG, fg=FG).pack(anchor="w")
+    d.tk.Label(d.body, text=", ".join(fields), font=(FONT, 8), bg=BG, fg=MUTED).pack(anchor="w", pady=(0, d.px(10)))
+    d.section(tr("WHAT HAPPENS"))
+    d.note(tr("The entry moves to the vault's Recycle Bin (restorable in KeePassXC) and its approvals are revoked in every project."))
+    d.section(tr("REASON"))
+    d.note(reason or tr("(the agent gave no reason)"))
+
+    def pick(ok: bool):
+        result["ok"] = ok
+        d.root.destroy()
+
+    comment = d.comment_box(lambda: pick(False), tr("COMMENT FOR THE AGENT IF YOU CANCEL (optional)"))
+    cancel = d.button(tr("Cancel"), lambda: pick(False), side="left")
+    delete = d.button(tr("Delete"), lambda: pick(True), primary=True)
+    d.root.bind("<Escape>", lambda _e: pick(False))
+    d.root.protocol("WM_DELETE_WINDOW", lambda: pick(False))
+    d.arm_after_delay(delete)
     d.run(cancel)
     return result["ok"], "" if result["ok"] else comment.get().strip()
 
@@ -940,37 +973,64 @@ def approval(project: str, name: str) -> str | None:
 
 
 def load_settings() -> dict:
-    """{"default_mode": "prompt"|"notify", "projects": {project: mode}}."""
+    """Read mode (get) and write mode (set): a global default plus per-project overrides; popup filter for the tray."""
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         data = {}
-    mode = data.get("default_mode")
-    projects = {k: v for k, v in (data.get("projects") or {}).items() if v in MODES}
-    return {"default_mode": mode if mode in MODES else "prompt", "projects": projects}
+    out = {}
+    for key in ("", "write_"):
+        mode = data.get(f"{key}default_mode")
+        out[f"{key}default_mode"] = mode if mode in MODES else "prompt"
+        out[f"{key}projects"] = {k: v for k, v in (data.get(f"{key}projects") or {}).items() if v in MODES}
+    out["popup"] = "selected" if data.get("popup") == "selected" else "all"
+    out["popup_secrets"] = {k: v for k, v in (data.get("popup_secrets") or {}).items() if isinstance(v, bool)}
+    return out
 
 
 def save_settings(data: dict) -> None:
     save_approvals(data, SETTINGS_FILE)
 
 
-def set_mode(mode: str | None, project: str | None) -> dict:
+def set_mode(mode: str | None, project: str | None, write: bool = False) -> dict:
     """project None sets the global default; mode None drops the project override."""
+    key = "write_" if write else ""
     with state_lock():
         data = load_settings()
         if project is None:
-            data["default_mode"] = mode or "prompt"
+            data[f"{key}default_mode"] = mode or "prompt"
         elif mode is None:
-            data["projects"].pop(project, None)
+            data[f"{key}projects"].pop(project, None)
         else:
-            data["projects"][project] = mode
+            data[f"{key}projects"][project] = mode
         save_settings(data)
     return data
 
 
-def project_mode(project: str) -> str:
+def project_mode(project: str, write: bool = False) -> str:
+    key = "write_" if write else ""
     data = load_settings()
-    return data["projects"].get(project, data["default_mode"])
+    return data[f"{key}projects"].get(project, data[f"{key}default_mode"])
+
+
+def popup_wanted(settings: dict, name: str) -> bool:
+    own = settings["popup_secrets"].get(name)
+    return own if own is not None else settings["popup"] == "all"
+
+
+def set_popup(name: str | None, on: bool | None, default: str | None = None) -> None:
+    """Tray only: there is deliberately no CLI for this, so an agent cannot silence its own notifications."""
+    with state_lock():
+        data = load_settings()
+        if default:
+            data["popup"] = default
+            data["popup_secrets"] = {k: v for k, v in data["popup_secrets"].items() if v != (default == "all")}
+        if name is not None:
+            if on is None or on == (data["popup"] == "all"):
+                data["popup_secrets"].pop(name, None)
+            else:
+                data["popup_secrets"][name] = on
+        save_settings(data)
 
 
 def tray_running() -> bool:
@@ -1154,10 +1214,15 @@ def _set_locked(args, parts, name, project, changes) -> int:
         print(tr("No change: the entry already has these values."), file=sys.stderr)
         return 0
 
-    ok, comment, opts = dialog_store(name, changes, project, args.reason, entry is None, locked, args.no_file,
-                                     not has_always(project, name))
-    audit(project=project, action="set", secret=name, fields=[f"{c['field']}:{c['state']}" for c in changes],
-          decision="ok" if ok else "deny", reason=args.reason, comment=comment, **opts)
+    fields = [f"{c['field']}:{c['state']}" for c in changes]
+    if project_mode(project, write=True) == "notify" and ensure_tray():
+        ok, comment, opts = True, "", {"no_file": bool(args.no_file), "always": False}
+        audit(project=project, action="set", secret=name, fields=fields, decision="notified", reason=args.reason, **opts)
+    else:
+        ok, comment, opts = dialog_store(name, changes, project, args.reason, entry is None, locked, args.no_file,
+                                         not has_always(project, name))
+        audit(project=project, action="set", secret=name, fields=fields,
+              decision="ok" if ok else "deny", reason=args.reason, comment=comment, **opts)
     if not ok:
         return refuse(tr("The user refused the save."), comment)
     tag = opts["no_file"] and not locked
@@ -1302,21 +1367,23 @@ def cmd_mode(args) -> int:
         project = None if args.globally else project_root(args.project or os.getcwd())
         new = None if args.mode == "default" else args.mode
         before = load_settings()
+        key = "write_" if args.write else ""
         if project is None:
-            loosens = new == "notify" and before["default_mode"] != "notify"
+            loosens = new == "notify" and before[f"{key}default_mode"] != "notify"
         else:
-            after = new or before["default_mode"]
-            loosens = after == "notify" and project_mode(project) != "notify"
-        if loosens and not dialog_mode(tr("all projects") if project is None else project, project):
-            audit(project=project or "*", action="mode", mode=args.mode, decision="deny")
+            after = new or before[f"{key}default_mode"]
+            loosens = after == "notify" and project_mode(project, args.write) != "notify"
+        if loosens and not dialog_mode(tr("all projects") if project is None else project, project, args.write):
+            audit(project=project or "*", action="mode", mode=args.mode, write=args.write, decision="deny")
             return fail(tr("Notify-only mode was not turned on."), EXIT_DENIED)
-        set_mode(new, project)
-        audit(project=project or "*", action="mode", mode=args.mode, decision="ok")
+        set_mode(new, project, args.write)
+        audit(project=project or "*", action="mode", mode=args.mode, write=args.write, decision="ok")
         if loosens:
             ensure_tray()
     data = load_settings()
     here = project_root(args.project or os.getcwd())
-    print(json.dumps({**data, "current_project": here, "current_mode": project_mode(here)}, indent=2, ensure_ascii=False))
+    print(json.dumps({**data, "current_project": here, "current_mode": project_mode(here),
+                      "current_write_mode": project_mode(here, True)}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1338,6 +1405,36 @@ def cmd_forget(args) -> int:
     for u in users:
         _kr_del(u)
     print(tr("Removed the remembered password and key from Credential Manager."))
+    return 0
+
+
+def cmd_delete(args) -> int:
+    """Always asks in a window: neither notify mode nor a standing approval covers destroying an entry."""
+    name = "/".join(p for p in args.name.split("/") if p)
+    project = project_root(os.getcwd())
+    try:
+        with file_lock("vault", DIALOG_TIMEOUT_S + 30):
+            kp = open_vault(project, for_write=True)
+            entry = vault_entries(kp).get(name)
+            if entry is None:
+                return fail(tr("No secret '{name}'. Use: secret-broker list", name=name), EXIT_NOT_FOUND)
+            ok, comment = dialog_delete(name, entry_fields(entry), project, args.reason)
+            audit(project=project, action="delete", secret=name, decision="ok" if ok else "deny", reason=args.reason, comment=comment)
+            if not ok:
+                return refuse(tr("The user refused the deletion."), comment)
+            kp.trash_entry(entry)
+            save_vault(kp)
+    except Locked as e:
+        return fail(str(e), EXIT_LOCKED)
+    for p in {*load_approvals(), *load_day_approvals()}:
+        revoke(p, name)
+    with state_lock():
+        data = load_no_file()
+        if name in data["names"]:
+            data["names"] = [n for n in data["names"] if n != name]
+            data["values"] = {k: v for k, v in data["values"].items() if v.get("name") != name}
+            save_no_file(data)
+    print(tr("Moved {name} to the Recycle Bin.", name=name), file=sys.stderr)
     return 0
 
 
@@ -1435,16 +1532,20 @@ def main(argv: list[str] | None = None) -> int:
     p_appr.add_argument("--project", metavar=tr("PATH"))
     p_forget = sub.add_parser("forget", help=tr("remove the remembered password from Credential Manager (confirmed in a window)"))
     p_forget.add_argument("--reason", default="")
+    p_delete = sub.add_parser("delete", help=tr("move an entry to the vault's Recycle Bin (always confirmed in a window)"))
+    p_delete.add_argument("name", help=tr("Group/Title"))
+    p_delete.add_argument("--reason", default="")
     p_mode = sub.add_parser("mode", help=tr("mode for secrets without a standing approval: prompt (window) / notify (notification only)"))
     p_mode.add_argument("mode", nargs="?", choices=[*MODES, "default"], help=tr("default removes the project's override"))
     where = p_mode.add_mutually_exclusive_group()
     where.add_argument("--global", dest="globally", action="store_true", help=tr("set the default mode for all projects"))
     where.add_argument("--project", metavar=tr("PATH"))
+    p_mode.add_argument("--write", action="store_true", help=tr("the mode for saving (set) instead of reading (get)"))
     sub.add_parser("tray", help=tr("tray icon: mode, history, approvals"))
     sub.add_parser("guard-hook", help=tr("Claude Code PreToolUse hook: blocks writing no-file secrets to files"))
     args = parser.parse_args(argv)
 
-    return {"list": cmd_list, "get": cmd_get, "set": cmd_set, "ask": cmd_ask, "init": cmd_init, "approvals": cmd_approvals, "forget": cmd_forget,
+    return {"list": cmd_list, "get": cmd_get, "set": cmd_set, "ask": cmd_ask, "init": cmd_init, "approvals": cmd_approvals, "forget": cmd_forget, "delete": cmd_delete,
             "mode": cmd_mode, "tray": cmd_tray, "guard-hook": cmd_guard_hook}[args.cmd](args)
 
 

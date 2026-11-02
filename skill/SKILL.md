@@ -19,12 +19,14 @@ The sanctioned way to obtain or save secrets. Values live in the user's KeePass 
 4. A secret you produced (new password, rotated key) → save it instead of writing it to a file:
    `printf %s "$VAL" | secret-broker set "Group/Title" --stdin [--username U] --reason "why"` or `--generate [LEN]`.
 5. When creating an entry, add `--no-file` if the value must never land in a file (API keys, tokens, production passwords).
+6. An entry that is no longer needed (a duplicate, a revoked key) → `secret-broker delete "Group/Title" --reason "why"`.
+   It moves the entry to the KeePass Recycle Bin and always asks the user in a window.
 
 ## Rules
 
 - Exit code `1` means the user declined or cancelled: do not retry without asking. Read stderr first: after `User comment:` the user may say what to do instead, and that comes first.
 - `2` missing entry/field, `3` vault locked or missing, `4` forbidden (a `no-file` value redirected to a file).
 - Never print secret values in the conversation or logs.
-- Never change the broker's mode, approvals, settings or state files; that is the user's decision. Do not run `secret-broker mode notify`.
+- Never change the broker's mode, approvals, settings or state files; that is the user's decision. Do not run `secret-broker mode notify` (with or without `--write`).
 - The master password is set and typed by the user only.
 - `no-file` entries stay in variables/processes; `guard-hook` blocks writes that contain them.

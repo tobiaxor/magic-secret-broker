@@ -2,11 +2,11 @@
 
 Give AI coding agents (Claude Code, Codex, Copilot CLI, Cursor…) the passwords and API keys they need **without pasting them into the chat or leaving them in `.env` files**.
 
-Secrets live in a KeePass (`.kdbx`) vault. The agent sees only entry names and runs a small CLI; each time it asks for a value, you decide in a window: once, for 24 hours, always in this project, or deny. If that is too many windows, switch a project (or everything) to **notify-only mode**: the agent gets the value at once and you get a Windows notification and a history entry.
+Secrets live in a KeePass (`.kdbx`) vault. The agent sees only entry names and runs a small CLI; each time it asks for a value, you decide in a window: once, for 24 hours, always in this project, or deny. If that is too many windows, switch a project (or everything) to **notify-only mode**: the agent gets the value at once and you get a small, silent notification in the corner of the screen and a history entry. Saving can work the same way.
 
-Windows only (Credential Manager, Windows notifications, tray icon). UI in English and Polish (picked from the Windows display language).
+Windows only (Credential Manager, tray icon). UI in English and Polish (picked from the Windows display language).
 
-![approval window](docs/images/window-approve.png) ![notification](docs/images/tray-toast.png)
+![approval window](docs/images/window-approve.png) ![notification](docs/images/tray-popup.png)
 
 ## Why
 
@@ -33,11 +33,12 @@ secret-broker list [--json]                          # entry names (Group/Title)
 secret-broker get NAME [--field FIELD] [--reason "why"]
 secret-broker set NAME [--stdin | --generate [LEN]] [--field FIELD] [--username U] [--url U] [--attr K=V]... [--no-file] [--reason "why"]
 secret-broker ask NAME [--field FIELD]... [--username U] [--url U] [--attr K=V]... [--no-file] [--print] [--reason "why"]
-secret-broker mode [prompt|notify|default] [--global | --project PATH]
+secret-broker mode [prompt|notify|default] [--global | --project PATH] [--write]
 secret-broker approvals [--revoke NAME [--project PATH]]
 secret-broker tray                                   # tray icon: mode, history, approvals
 secret-broker init
 secret-broker forget [--reason "why"]                # remove the remembered master password
+secret-broker delete NAME [--reason "why"]           # move an entry to the Recycle Bin (always asks)
 ```
 
 The agent fetches a value inside the command that uses it, so it never sits in a file or a shell variable between calls:
@@ -58,15 +59,24 @@ Exit codes: `0` OK, `1` denied or cancelled, `2` missing entry or field, `3` vau
 | **`ask`** lets *you* type a secret the agent needs (an API key from a web console). The agent supplies only the name, reason and username/URL hints. "Always in this project" is ticked for a new entry: untick it if the agent should ask before reading it. | ![ask](docs/images/window-ask.png) |
 | **`set`** saves a value the agent produced (a generated or rotated password) after you confirm. Changed fields are marked; the previous version stays in the entry's KeePass history. | ![set](docs/images/window-store.png) |
 
+**`delete`** moves an entry to the vault's Recycle Bin after you confirm, and revokes its approvals in every project. It always asks: neither notify mode nor an "always" approval covers a deletion. Restore or empty the bin in KeePassXC.
+
 `init`, unlocking and `forget` have their own windows. With **Remember** ticked, the master password and derived key go to Windows Credential Manager, so later calls do not ask for it.
 
 ### Notify-only mode and the tray icon
 
-In `notify` mode a secret without a standing approval is released at once, and the tray icon shows a notification with the secret, project, field and reason. If the tray icon cannot be started, the broker falls back to the approval window. Secrets with an "always" or "24 hours" approval never ask and never notify.
+In `notify` mode a secret without a standing approval is released at once, and a small card slides into the bottom-right corner with the secret, project, field and reason. It makes no sound, never takes the keyboard focus and fades out after a few seconds (hover to keep it). Click it to open the history at that request. If the tray icon cannot be started, the broker falls back to the approval window. Secrets with an "always" or "24 hours" approval never ask and never notify.
 
-The mode has a global default and per-project overrides. Set it in the tray window or with `secret-broker mode`. Turning notify mode **on** from the command line opens a confirmation window, because an agent could run that command; turning it off does not.
+![notification](docs/images/tray-popup.png)
 
-The tray icon (amber with a red dot while the global default is `notify`) opens a window with the mode settings, the full access history and the standing approvals, which you can revoke.
+Reading (`get`) and saving (`set`) have separate modes, each with a global default and per-project overrides. In saving notify mode the agent creates and overwrites entries without the confirmation window; the previous value stays in the entry's KeePass history. Set the modes in the tray window or with `secret-broker mode` (`--write` for saving). Turning notify mode **on** from the command line opens a confirmation window, because an agent could run that command; turning it off does not.
+
+The tray icon (amber with a red dot while a global default is `notify`) opens a window with:
+
+- **Mode**: reading and saving modes, globally and per project;
+- **History**: every read, save and approval, with the decision and reason. Select a row (or right-click it) to turn notifications for that secret off or on;
+- **Standing approvals**, which you can revoke;
+- **Notifications**: show a card for every secret except the ones turned off, or only for the ones turned on (say, root and admin accounts). Every use is still logged either way. There is no command-line switch for this, so an agent cannot silence its own notifications.
 
 ![mode](docs/images/tray-mode.png)
 ![history](docs/images/tray-history.png)
