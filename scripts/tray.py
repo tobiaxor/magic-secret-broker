@@ -13,6 +13,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 import secret_broker as sb
+import vault_cache
 from secret_broker import tr
 
 POLL_S = 1.0
@@ -559,6 +560,21 @@ def main() -> int:
     def is_default(mode, write=False):
         return lambda _it: sb.load_settings()["write_default_mode" if write else "default_mode"] == mode
 
+    def set_cache(hours):
+        def go(_i, _it):
+            sb.set_cache_hours(hours)
+            if not hours:
+                vault_cache.request({"op": "clear"})
+            sb.audit(project="*", action="cache", mode=f"{hours}h", decision="ok-tray")
+            refresh_icon()
+        return go
+
+    def is_cache(hours):
+        return lambda _it: sb.load_settings()["cache_hours"] == hours
+
+    def cache_label(hours):
+        return tr("Off") if not hours else tr("{hours} h", hours=hours)
+
     def quit_all(_i, _it):
         icon.stop()
         calls.put(root.destroy)
@@ -574,6 +590,9 @@ def main() -> int:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(tr("Saving: ask in a window"), set_default("prompt", True), checked=is_default("prompt", True), radio=True),
         pystray.MenuItem(tr("Saving: notify only"), set_default("notify", True), checked=is_default("notify", True), radio=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(tr("Vault cache in memory"), pystray.Menu(*[
+            pystray.MenuItem(cache_label(h), set_cache(h), checked=is_cache(h), radio=True) for h in vault_cache.HOUR_CHOICES])),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(tr("Quit"), quit_all),
     )
@@ -606,6 +625,7 @@ def main() -> int:
                 pass
 
     threading.Thread(target=poll_loop, daemon=True).start()
+    threading.Thread(target=vault_cache.serve, daemon=True).start()
     root.after(100, pump)
     root.mainloop()
     k32.CloseHandle(mutex)

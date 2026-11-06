@@ -618,7 +618,7 @@ def _kr_del(user: str) -> None:
     _advapi.CredDeleteW(_target(user), _CRED_TYPE_GENERIC, 0)
 
 
-def open_vault(project: str | None = None, for_write: bool = False):
+def open_vault(project: str | None = None, for_write: bool = False, interactive: bool = True):
     """Cached transformed key first (skips Argon2); it goes stale whenever KeePassXC re-saves with a new salt.
 
     for_write needs the real password: pykeepass saving a vault opened only by transformed_key writes an unopenable file.
@@ -651,6 +651,8 @@ def open_vault(project: str | None = None, for_write: bool = False):
         except CredentialsError:
             _kr_del(pw_user)
 
+    if not interactive:
+        raise Locked(tr("The vault is locked; run any secret-broker command to unlock it."))
     error = ""
     for _ in range(3):
         res = dialog_password(str(KDBX_PATH), error, project)
@@ -985,7 +987,16 @@ def load_settings() -> dict:
         out[f"{key}projects"] = {k: v for k, v in (data.get(f"{key}projects") or {}).items() if v in MODES}
     out["popup"] = "selected" if data.get("popup") == "selected" else "all"
     out["popup_secrets"] = {k: v for k, v in (data.get("popup_secrets") or {}).items() if isinstance(v, bool)}
+    hours = data.get("cache_hours")
+    out["cache_hours"] = hours if isinstance(hours, (int, float)) and not isinstance(hours, bool) and 0 <= hours <= 24 else 0
     return out
+
+
+def set_cache_hours(hours: float) -> None:
+    with state_lock():
+        data = load_settings()
+        data["cache_hours"] = hours
+        save_settings(data)
 
 
 def save_settings(data: dict) -> None:
@@ -1110,11 +1121,13 @@ def cmd_list(args) -> int:
 
 def cmd_get(args) -> int:
     project = project_root(os.getcwd())
-    try:
-        entries = vault_entries(open_vault(project))
-    except Locked as e:
-        return fail(str(e), EXIT_LOCKED)
-    entry = entries.get(args.name)
+    import vault_cache
+    hit, entry = vault_cache.cached_entry(args.name)
+    if not hit:
+        try:
+            entry = vault_entries(open_vault(project)).get(args.name)
+        except Locked as e:
+            return fail(str(e), EXIT_LOCKED)
     if entry is None:
         return fail(tr("No secret '{name}'. Use: secret-broker list", name=args.name), EXIT_NOT_FOUND)
     value = entry_value(entry, args.field)
@@ -1387,6 +1400,20 @@ def cmd_mode(args) -> int:
     return 0
 
 
+def cmd_cache(args) -> int:
+    """Turning the cache on or lengthening it is a tray click only: an agent must not widen it by itself."""
+    import vault_cache
+    if args.action in ("off", "clear"):
+        if args.action == "off":
+            set_cache_hours(0)
+        vault_cache.request({"op": "clear"})
+        audit(project="*", action="cache", mode=args.action, decision="ok")
+    status = vault_cache.request({"op": "status"}) or {"ok": False, "hours": load_settings()["cache_hours"], "loaded": False,
+                                                      "tray": "not running"}
+    print(json.dumps(status, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_tray(_args) -> int:
     import tray
     return tray.main()
@@ -1541,12 +1568,14 @@ def main(argv: list[str] | None = None) -> int:
     where.add_argument("--global", dest="globally", action="store_true", help=tr("set the default mode for all projects"))
     where.add_argument("--project", metavar=tr("PATH"))
     p_mode.add_argument("--write", action="store_true", help=tr("the mode for saving (set) instead of reading (get)"))
+    p_cache = sub.add_parser("cache", help=tr("in-memory vault cache in the tray: status, off, clear (turn it on in the tray menu)"))
+    p_cache.add_argument("action", nargs="?", choices=["status", "off", "clear"], default="status")
     sub.add_parser("tray", help=tr("tray icon: mode, history, approvals"))
     sub.add_parser("guard-hook", help=tr("Claude Code PreToolUse hook: blocks writing no-file secrets to files"))
     args = parser.parse_args(argv)
 
     return {"list": cmd_list, "get": cmd_get, "set": cmd_set, "ask": cmd_ask, "init": cmd_init, "approvals": cmd_approvals, "forget": cmd_forget, "delete": cmd_delete,
-            "mode": cmd_mode, "tray": cmd_tray, "guard-hook": cmd_guard_hook}[args.cmd](args)
+            "mode": cmd_mode, "cache": cmd_cache, "tray": cmd_tray, "guard-hook": cmd_guard_hook}[args.cmd](args)
 
 
 if __name__ == "__main__":

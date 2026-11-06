@@ -220,4 +220,9 @@ PL = {
     'Moved {name} to the Recycle Bin.': 'Przeniesiono {name} do Kosza.',
     "move an entry to the vault's Recycle Bin (always confirmed in a window)": 'przenieś wpis do Kosza w sejfie (zawsze z potwierdzeniem w okienku)',
     'Group/Title': 'Grupa/Tytuł',
+    'The vault is locked; run any secret-broker command to unlock it.': 'Sejf jest zamknięty; uruchom dowolną komendę secret-broker, żeby go odblokować.',
+    'in-memory vault cache in the tray: status, off, clear (turn it on in the tray menu)': 'cache sejfu w pamięci traya: status, off, clear (włączasz w menu traya)',
+    'Vault cache in memory': 'Cache sejfu w pamięci',
+    'Off': 'Wyłączony',
+    '{hours} h': '{hours} h',
 }

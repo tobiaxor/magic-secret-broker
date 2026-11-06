@@ -35,7 +35,8 @@ secret-broker set NAME [--stdin | --generate [LEN]] [--field FIELD] [--username 
 secret-broker ask NAME [--field FIELD]... [--username U] [--url U] [--attr K=V]... [--no-file] [--print] [--reason "why"]
 secret-broker mode [prompt|notify|default] [--global | --project PATH] [--write]
 secret-broker approvals [--revoke NAME [--project PATH]]
-secret-broker tray                                   # tray icon: mode, history, approvals
+secret-broker tray                                   # tray icon: mode, history, approvals, vault cache
+secret-broker cache [status|off|clear]               # in-memory vault cache (turned on in the tray menu)
 secret-broker init
 secret-broker forget [--reason "why"]                # remove the remembered master password
 secret-broker delete NAME [--reason "why"]           # move an entry to the Recycle Bin (always asks)
@@ -81,6 +82,12 @@ The tray icon (amber with a red dot while a global default is `notify`) opens a 
 ![mode](docs/images/tray-mode.png)
 ![history](docs/images/tray-history.png)
 
+### Vault cache in memory
+
+Every `get` opens the vault: start Python, decrypt the file and parse its XML (about 0.4 s for a vault with a few hundred entries; the slow Argon2 step is already skipped through the remembered key). With **Vault cache in memory** in the tray menu set to 1, 4 or 8 hours, the tray keeps the decrypted entries in its own process and `get` asks it through a named pipe that only your Windows account may open (no remote clients), which brings a `get` down to the Python start-up (about 0.15 s). Approvals, notifications, the audit log and the `no-file` check run exactly as before; the cache only answers what an entry holds.
+
+The cache reloads when the `.kdbx` file changes, drops the values once the chosen time has passed since they were loaded, and empties at once when you pick **Off**. It is off by default. It can be turned on or lengthened only from the tray menu: `secret-broker cache off` and `clear` are allowed from the command line, because they only tighten it. If the tray is not running or the vault is locked, `get` opens the vault itself as before.
+
 ### `no-file` secrets
 
 Tag an entry `no-file` (KeePass *Tags* field, or the checkbox in the `set`/`ask` windows) when its value must never be written to a file. `get` refuses to redirect it to a file (exit 4) and the `guard-hook` subcommand, installed as a Claude Code `PreToolUse` hook (matcher `Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell`), blocks file writes and redirecting shell commands that contain such a value. The hook stores only HMACs of values it has seen. Writes to the temp folder and to git-ignored files inside a temporary linked worktree are allowed.
@@ -117,7 +124,8 @@ It is **not** a security boundary against an agent that runs arbitrary commands 
 
 - read the remembered master password from Windows Credential Manager and open the vault directly, with no window and no log entry;
 - edit the approval, settings and audit files, run from another project's directory, or click the approval window;
-- stop or impersonate the tray icon, or replace the broker's scripts, venv or shims.
+- stop or impersonate the tray icon, or replace the broker's scripts, venv or shims;
+- ask the vault cache's pipe for any entry while the cache is on, or read the decrypted values from the tray's memory.
 
 The audit log and notifications are informational, not tamper-proof. `no-file` is a lint for mistakes: encoded, split or indirect writes are not detected. Approvals cover a whole entry (all its fields), not a single field. The reason text comes from the agent; read it critically, and never type your master password into an `ask` window.
 
