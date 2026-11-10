@@ -117,6 +117,7 @@ class _Dialog:
         self.tk = tk
         self.t = THEMES[theme]
         self.root = root = tk.Tk()
+        root.withdraw()
         # Tk scales fonts with DPI but not pixel paddings.
         self.scale = max(1.0, float(root.tk.call("tk", "scaling")) / (96 / 72))
         root.title(window_title)
@@ -208,8 +209,9 @@ class _Dialog:
     def run(self, focus) -> None:
         root = self.root
         root.update_idletasks()
-        w, h = root.winfo_width(), root.winfo_height()
+        w, h = root.winfo_reqwidth(), root.winfo_reqheight()
         root.geometry(f"+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
+        root.deiconify()
         root.lift()
         root.focus_force()
         focus.focus_set()
@@ -1520,7 +1522,25 @@ def cmd_guard_hook(_args) -> int:
     return 0
 
 
+def _drop_own_console() -> None:
+    """A caller without a console (a GUI agent, a scheduled task) makes Windows open an empty black one for python.exe.
+    With Windows Terminal as the default terminal, hiding that window does nothing; detaching closes it."""
+    k = ctypes.windll.kernel32
+    if not k.GetConsoleWindow():
+        return
+    pids = (wintypes.DWORD * 8)()
+    n = k.GetConsoleProcessList(pids, 8)
+    # uv's venv python.exe is a launcher, so a console made just for us may also hold our parent.
+    if not (0 < n <= 2 and set(pids[:n]) <= {os.getpid(), os.getppid()}):
+        return
+    on_console = [name for name in ("stdout", "stderr") if getattr(sys, name) is not None and getattr(sys, name).isatty()]
+    k.FreeConsole()
+    for name in on_console:
+        setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
 def main(argv: list[str] | None = None) -> int:
+    _drop_own_console()
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
