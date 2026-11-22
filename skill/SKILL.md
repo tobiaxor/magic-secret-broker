@@ -1,11 +1,11 @@
 ---
 name: secret-broker
-description: Get, store or request passwords, API keys and tokens through the secret-broker CLI backed by the user's KeePass vault. Use whenever a task needs a credential, instead of reading .env files or searching the disk.
+description: Get, store or request passwords, API keys and tokens through the secret-broker CLI backed by the user's encrypted vault. Use whenever a task needs a credential, instead of reading .env files or searching the disk.
 ---
 
 # secret-broker
 
-The sanctioned way to obtain or save secrets. Values live in the user's KeePass vault; you see entry names only. Depending on the user's settings, a value is released after approval in a window, through a standing approval, or at once with a notification to the user.
+The sanctioned way to obtain or save secrets. Values live in the user's encrypted vault; you see entry names only. Depending on the user's settings, a value is released after approval in a window, through a standing approval, or at once with a notification to the user.
 
 ## Workflow
 
@@ -20,7 +20,7 @@ The sanctioned way to obtain or save secrets. Values live in the user's KeePass 
    `printf %s "$VAL" | secret-broker set "Group/Title" --stdin [--username U] --reason "why"` or `--generate [LEN]`.
 5. When creating an entry, add `--no-file` if the value must never land in a file (API keys, tokens, production passwords).
 6. An entry that is no longer needed (a duplicate, a revoked key) → `secret-broker delete "Group/Title" --reason "why"`.
-   It moves the entry to the KeePass Recycle Bin and always asks the user in a window.
+   It moves the entry to the vault's Recycle Bin and always asks the user in a window.
 
 ## Rules
 

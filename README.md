@@ -2,7 +2,7 @@
 
 Give AI coding agents (Claude Code, Codex, Copilot CLI, Cursor…) the passwords and API keys they need **without pasting them into the chat or leaving them in `.env` files**.
 
-Secrets live in a KeePass (`.kdbx`) vault. The agent sees only entry names and runs a small CLI; each time it asks for a value, you decide in a window: once, for 24 hours, always in this project, or deny. If that is too many windows, switch a project (or everything) to **notify-only mode**: the agent gets the value at once and you get a small, silent notification in the corner of the screen and a history entry. Saving can work the same way.
+Secrets live in an encrypted `.kdbx` vault (the KeePass file format), which you browse and edit in the broker's own **Secrets** window: no KeePass app is needed. The agent sees only entry names and runs a small CLI; each time it asks for a value, you decide in a window: once, for 24 hours, always in this project, or deny. If that is too many windows, switch a project (or everything) to **notify-only mode**: the agent gets the value at once and you get a small, silent notification in the corner of the screen and a history entry. Saving can work the same way.
 
 Windows only (Credential Manager, tray icon). UI in English and Polish (picked from the Windows display language).
 
@@ -35,7 +35,8 @@ secret-broker set NAME [--stdin | --generate [LEN]] [--field FIELD] [--username 
 secret-broker ask NAME [--field FIELD]... [--username U] [--url U] [--attr K=V]... [--no-file] [--print] [--reason "why"]
 secret-broker mode [prompt|notify|default] [--global | --project PATH] [--write]
 secret-broker approvals [--revoke NAME [--project PATH]]
-secret-broker tray                                   # tray icon: mode, history, approvals, vault cache
+secret-broker open                                   # the Secrets window: browse, search, edit, unlock and lock the vault
+secret-broker tray                                   # tray icon: Secrets window, mode, history, approvals, vault cache
 secret-broker cache [status|off|clear]               # in-memory vault cache (turned on in the tray menu)
 secret-broker init
 secret-broker forget [--reason "why"]                # remove the remembered master password
@@ -58,11 +59,26 @@ Exit codes: `0` OK, `1` denied or cancelled, `2` missing entry or field, `3` vau
 |---|---|
 | **`get`** asks: **Once**, **For 24 hours**, **Always in this project** or **Deny**. Nothing is asked when an approval already exists. Buttons arm after 0.8 s and Enter approves nothing, so a stray keypress cannot grant access. You can leave a comment for the agent when you deny ("use the test key"); it is printed on stderr. | ![get](docs/images/window-approve.png) |
 | **`ask`** lets *you* type a secret the agent needs (an API key from a web console). The agent supplies only the name, reason and username/URL hints. "Always in this project" is ticked for a new entry: untick it if the agent should ask before reading it. | ![ask](docs/images/window-ask.png) |
-| **`set`** saves a value the agent produced (a generated or rotated password) after you confirm. Changed fields are marked; the previous version stays in the entry's KeePass history. | ![set](docs/images/window-store.png) |
+| **`set`** saves a value the agent produced (a generated or rotated password) after you confirm. Changed fields are marked; the previous version stays in the entry's history. | ![set](docs/images/window-store.png) |
 
-**`delete`** moves an entry to the vault's Recycle Bin after you confirm, and revokes its approvals in every project. It always asks: neither notify mode nor an "always" approval covers a deletion. Restore or empty the bin in KeePassXC.
+**`delete`** moves an entry to the vault's Recycle Bin after you confirm, and revokes its approvals in every project. It always asks: neither notify mode nor an "always" approval covers a deletion. Restore or empty the bin in the Secrets window.
 
 `init`, unlocking and `forget` have their own windows. With **Remember** ticked, the master password and derived key go to Windows Credential Manager, so later calls do not ask for it.
+
+### The Secrets window
+
+Double-click the tray icon (or run `secret-broker open`) to manage the vault yourself:
+
+- a tree of groups and entries with search across names, usernames, URLs, notes and plain fields (Ctrl+F);
+- the selected entry's fields, masked until you click the eye, with copy buttons. Copied values skip the Windows clipboard history and cloud clipboard and are cleared after 30 seconds (only if the clipboard still holds them). Copying a password is logged in the history;
+- the entry's standing approvals, and its earlier versions (**History**) with a one-click restore;
+- **New entry** / **Edit**: name (`Group/Title`, renaming moves the entry and carries its approvals and `no-file` state over), username, password with a generator, URL, notes, any number of extra fields (each plain or secret) and the `no-file` tag;
+- **Delete** to the Recycle Bin (approvals revoked in every project); in the **Recycle Bin** view, restore to the original group, delete permanently or empty the bin. Right-click a group to rename it or delete it when empty.
+
+The window unlocks with the remembered master password, or asks for it (and can remember it); with no vault yet, it creates one. **Lock** (Ctrl+L), closing the window or 10 minutes without activity drop the decrypted vault and the password from memory and clear a copied value; **Forget the remembered password** on the locked screen removes it from Credential Manager. Every write takes the same lock as the CLI and is made on the file as it is on disk, so a save by an agent in the meantime is never lost; while an agent's window holds the vault, the Secrets window says so and saves nothing. Changes appear in the tray history as made "by you".
+
+![Secrets window](docs/images/secrets-main.png)
+![edit entry](docs/images/secrets-edit.png)
 
 ### Notify-only mode and the tray icon
 
@@ -70,7 +86,7 @@ In `notify` mode a secret without a standing approval is released at once, and a
 
 ![notification](docs/images/tray-popup.png)
 
-Reading (`get`) and saving (`set`) have separate modes, each with a global default and per-project overrides. In saving notify mode the agent creates and overwrites entries without the confirmation window; the previous value stays in the entry's KeePass history. Set the modes in the tray window or with `secret-broker mode` (`--write` for saving). Turning notify mode **on** from the command line opens a confirmation window, because an agent could run that command; turning it off does not.
+Reading (`get`) and saving (`set`) have separate modes, each with a global default and per-project overrides. In saving notify mode the agent creates and overwrites entries without the confirmation window; the previous value stays in the entry's history. Set the modes in the tray window or with `secret-broker mode` (`--write` for saving). Turning notify mode **on** from the command line opens a confirmation window, because an agent could run that command; turning it off does not.
 
 The tray icon (amber with a red dot while a global default is `notify`) opens a window with:
 
@@ -90,7 +106,7 @@ The cache reloads when the `.kdbx` file changes, drops the values once the chose
 
 ### `no-file` secrets
 
-Tag an entry `no-file` (KeePass *Tags* field, or the checkbox in the `set`/`ask` windows) when its value must never be written to a file. `get` refuses to redirect it to a file (exit 4) and the `guard-hook` subcommand, installed as a Claude Code `PreToolUse` hook (matcher `Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell`), blocks file writes and redirecting shell commands that contain such a value. The hook stores only HMACs of values it has seen. Writes to the temp folder and to git-ignored files inside a temporary linked worktree are allowed.
+Tag an entry `no-file` (the checkbox in the Secrets window's editor or in the `set`/`ask` windows) when its value must never be written to a file. `get` refuses to redirect it to a file (exit 4) and the `guard-hook` subcommand, installed as a Claude Code `PreToolUse` hook (matcher `Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell`), blocks file writes and redirecting shell commands that contain such a value. The hook stores only HMACs of values it has seen. Writes to the temp folder and to git-ignored files inside a temporary linked worktree are allowed.
 
 ## Configuration
 
@@ -107,8 +123,8 @@ Tag an entry `no-file` (KeePass *Tags* field, or the checkbox in the `set`/`ask`
 
 | Key | Default | |
 |---|---|---|
-| `vault` | `~/Documents/secret-broker.kdbx` | the KeePass file |
-| `keyfile` | none | KeePass key file |
+| `vault` | `~/Documents/secret-broker.kdbx` | the vault file (`.kdbx`; KeePass-compatible) |
+| `keyfile` | none | key file required together with the master password |
 | `backup_task` | none | Windows scheduled task run after each vault write (e.g. an off-site copy) |
 | `lang` | Windows display language | `en` or `pl` |
 
@@ -125,7 +141,7 @@ It is **not** a security boundary against an agent that runs arbitrary commands 
 - read the remembered master password from Windows Credential Manager and open the vault directly, with no window and no log entry;
 - edit the approval, settings and audit files, run from another project's directory, or click the approval window;
 - stop or impersonate the tray icon, or replace the broker's scripts, venv or shims;
-- ask the vault cache's pipe for any entry while the cache is on, or read the decrypted values from the tray's memory.
+- ask the vault cache's pipe for any entry while the cache is on, or read the decrypted values (and, while the Secrets window is unlocked, the master password) from the tray's memory.
 
 The audit log and notifications are informational, not tamper-proof. `no-file` is a lint for mistakes: encoded, split or indirect writes are not detected. Approvals cover a whole entry (all its fields), not a single field. The reason text comes from the agent; read it critically, and never type your master password into an `ask` window.
 

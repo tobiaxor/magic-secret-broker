@@ -1,4 +1,4 @@
-"""Tray icon for secret-broker: notifications for secrets used without a window, mode settings, history, approvals."""
+"""Tray icon for secret-broker: the Secrets window, notifications for secrets used without a window, modes, history, approvals."""
 
 import ctypes
 import json
@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 
 import secret_broker as sb
 import vault_cache
+import vault_ui
 from secret_broker import tr
 
 POLL_S = 1.0
@@ -33,8 +34,11 @@ DECISIONS = {
     "deny": tr("denied"),
     "blocked-file": tr("blocked (no-file → file)"),
     "ok": "OK",
+    "ok-tray": tr("by you"),
 }
-ACTIONS = {"set": tr("save"), "ask": tr("typed in"), "revoke": tr("revoke"), "mode": tr("mode"), "popup": tr("notification")}
+ACTIONS = {"set": tr("save"), "ask": tr("typed in"), "revoke": tr("revoke"), "mode": tr("mode"), "popup": tr("notification"),
+           "delete": tr("delete"), "create": tr("created"), "edit": tr("edited"), "trash": tr("to the Recycle Bin"),
+           "restore": tr("restored"), "purge": tr("deleted permanently"), "copy": tr("copied")}
 
 
 def icon_image(mode: str) -> Image.Image:
@@ -337,7 +341,7 @@ class Window:
             for c, (mode, mlabel) in enumerate(sb.MODES.items(), start=1):
                 tk.Radiobutton(grid, text=mlabel, value=mode, variable=var, font=(sb.FONT, 10), bg=sb.BG, activebackground=sb.BG,
                                command=lambda v=var, wr=write: self._set(v.get(), None, wr)).grid(row=r, column=c, sticky="w", padx=(0, 18))
-        self._note(f, tr("“Notify only”: the agent reads (or saves) at once; a small notification appears in the corner of the screen and the request is logged in the history. Secrets with a standing approval (“always” / “24 hours”) are read without asking or notifying. Overwritten values stay in the entry's KeePass history.")).pack(anchor="w", pady=(4, 14))
+        self._note(f, tr("“Notify only”: the agent reads (or saves) at once; a small notification appears in the corner of the screen and the request is logged in the history. Secrets with a standing approval (“always” / “24 hours”) are read without asking or notifying. Overwritten values stay in the entry's history (Secrets window).")).pack(anchor="w", pady=(4, 14))
 
         self._label(f, tr("PROJECTS (OVERRIDE THE DEFAULT MODE)")).pack(anchor="w")
         frame, self.proj_tree = self._tree(f, {tr("Project"): 170, tr("Path"): 400, tr("Reading"): 210, tr("Saving"): 210})
@@ -550,6 +554,7 @@ def main() -> int:
         icon.update_menu()
 
     window = Window(root, refresh_icon)
+    secrets_window = vault_ui.SecretsWindow(root)
     popups = Popups(root, window.show_event)
 
     def set_default(mode, write=False):
@@ -577,10 +582,11 @@ def main() -> int:
 
     def quit_all(_i, _it):
         icon.stop()
-        calls.put(root.destroy)
+        calls.put(lambda: (secrets_window.lock(render=False), root.destroy()))
 
     menu = pystray.Menu(
-        pystray.MenuItem(tr("Settings…"), lambda _i, _it: calls.put(lambda: window.show(0)), default=True),
+        pystray.MenuItem(tr("Secrets…"), lambda _i, _it: calls.put(secrets_window.show), default=True),
+        pystray.MenuItem(tr("Settings…"), lambda _i, _it: calls.put(lambda: window.show(0))),
         pystray.MenuItem(tr("History…"), lambda _i, _it: calls.put(lambda: window.show(1))),
         pystray.MenuItem(tr("Standing approvals…"), lambda _i, _it: calls.put(lambda: window.show(2))),
         pystray.MenuItem(tr("Notifications…"), lambda _i, _it: calls.put(lambda: window.show(3))),
@@ -625,7 +631,7 @@ def main() -> int:
                 pass
 
     threading.Thread(target=poll_loop, daemon=True).start()
-    threading.Thread(target=vault_cache.serve, daemon=True).start()
+    threading.Thread(target=vault_cache.serve, kwargs={"on_show": lambda: calls.put(secrets_window.show)}, daemon=True).start()
     root.after(100, pump)
     root.mainloop()
     k32.CloseHandle(mutex)

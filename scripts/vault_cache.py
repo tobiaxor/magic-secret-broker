@@ -147,7 +147,7 @@ class Cache:
                     "entries": len(self.entries) if self.entries is not None else 0}
 
 
-def _handle(cache: Cache, raw: bytes) -> dict:
+def _handle(cache: Cache, raw: bytes, on_show=None) -> dict:
     try:
         req = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -160,10 +160,13 @@ def _handle(cache: Cache, raw: bytes) -> dict:
     if op == "clear":
         cache.clear()
         return {"ok": True}
+    if op == "show" and on_show is not None:
+        on_show()
+        return {"ok": True}
     return {"ok": False, "reason": "bad request"}
 
 
-def serve(stop: threading.Event | None = None) -> None:
+def serve(stop: threading.Event | None = None, on_show=None) -> None:
     """Blocking server loop; the tray runs it in a daemon thread."""
     cache = Cache()
     sa = _user_only_sa()
@@ -191,7 +194,7 @@ def serve(stop: threading.Event | None = None) -> None:
             if not _k32.ReadFile(h, ctypes.cast(buf, ctypes.c_void_p), MAX_MSG, ctypes.byref(got), None):
                 continue
             try:
-                resp = _handle(cache, buf.raw[:got.value])
+                resp = _handle(cache, buf.raw[:got.value], on_show)
             except Exception as e:  # noqa: BLE001 - one bad request must not stop the server
                 resp = {"ok": False, "reason": "error", "detail": type(e).__name__}
             data = json.dumps(resp, ensure_ascii=False).encode("utf-8")

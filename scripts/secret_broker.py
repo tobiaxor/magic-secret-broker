@@ -1,4 +1,4 @@
-"""Secret broker CLI: KeePass vault, names visible to the agent, values only after user approval."""
+"""Secret broker CLI: .kdbx vault, names visible to the agent, values only after user approval."""
 
 import argparse
 import base64
@@ -483,7 +483,7 @@ def dialog_mode(scope: str, project: str | None, write: bool = False) -> bool:
         d = _Dialog("forget", tr("Secret broker — notify-only mode"), tr("Save without asking?"), "secret-broker mode notify --write", project)
         d.section(tr("WHAT HAPPENS"))
         d.note(tr("In {scope}, the agent will create and overwrite vault entries without a window; you only get a notification. "
-                  "Overwritten values stay in the entry's KeePass history.", scope=scope))
+                  "Overwritten values stay in the entry's history.", scope=scope))
     else:
         d = _Dialog("forget", tr("Secret broker — notify-only mode"), tr("Turn on notify-only mode?"), "secret-broker mode notify", project)
         d.section(tr("WHAT HAPPENS"))
@@ -538,7 +538,7 @@ def dialog_delete(secret: str, fields: list[str], project: str, reason: str) -> 
     d.tk.Label(d.body, text=secret, font=(FONT, 11, "bold"), bg=BG, fg=FG).pack(anchor="w")
     d.tk.Label(d.body, text=", ".join(fields), font=(FONT, 8), bg=BG, fg=MUTED).pack(anchor="w", pady=(0, d.px(10)))
     d.section(tr("WHAT HAPPENS"))
-    d.note(tr("The entry moves to the vault's Recycle Bin (restorable in KeePassXC) and its approvals are revoked in every project."))
+    d.note(tr("The entry moves to the vault's Recycle Bin (restorable in the Secrets window) and its approvals are revoked in every project."))
     d.section(tr("REASON"))
     d.note(reason or tr("(the agent gave no reason)"))
 
@@ -736,6 +736,37 @@ def _in_recycle_bin(entry, recycle) -> bool:
             return True
         g = g.parentgroup
     return False
+
+
+def in_trash(kp, entry) -> bool:
+    recycle = kp.recyclebin_group
+    return recycle is not None and _in_recycle_bin(entry, recycle)
+
+
+def trash_entry(kp, entry) -> None:
+    """Records the group as KDBX 4.1 PreviousParentGroup (as KeePassXC does) so a restore knows where it came from."""
+    from lxml.etree import SubElement
+
+    prev = entry._element.find("PreviousParentGroup")
+    if prev is None:
+        prev = SubElement(entry._element, "PreviousParentGroup")
+    prev.text = base64.b64encode(entry.group.uuid.bytes).decode()
+    kp.trash_entry(entry)
+
+
+def restore_group(kp, entry):
+    import uuid as uuidlib
+
+    prev = entry._element.find("PreviousParentGroup")
+    if prev is not None and prev.text:
+        try:
+            group = kp.find_groups(uuid=uuidlib.UUID(bytes=base64.b64decode(prev.text)), first=True)
+        except ValueError:
+            group = None
+        recycle = kp.recyclebin_group
+        if group is not None and group != recycle and not (recycle is not None and _in_recycle_bin(group, recycle)):
+            return group
+    return kp.root_group
 
 
 def vault_entries(kp) -> dict:
@@ -964,6 +995,50 @@ def revoke(project: str, name: str) -> None:
         save_approvals({p: g for p, g in day.items() if g}, DAY_APPROVALS_FILE)
 
 
+def drop_secret_state(name: str) -> None:
+    """A deleted entry loses every approval and its no-file fingerprints."""
+    for p in {*load_approvals(), *load_day_approvals()}:
+        revoke(p, name)
+    forget_no_file(name)
+
+
+def forget_no_file(name: str) -> None:
+    with state_lock():
+        data = load_no_file()
+        if name in data["names"] or any(v.get("name") == name for v in data["values"].values()):
+            data["names"] = [n for n in data["names"] if n != name]
+            data["values"] = {k: v for k, v in data["values"].items() if v.get("name") != name}
+            save_no_file(data)
+
+
+def rename_secret_state(old: str, new: str) -> None:
+    """Approvals, no-file names and notification choices are keyed by entry name, so a rename carries them over."""
+    if old == new:
+        return
+    with state_lock():
+        always = load_approvals()
+        for p, names in always.items():
+            if old in names:
+                always[p] = sorted((set(names) - {old}) | {new})
+        save_approvals(always)
+        day = load_day_approvals()
+        for grants in day.values():
+            if old in grants:
+                grants[new] = grants.pop(old)
+        save_approvals(day, DAY_APPROVALS_FILE)
+        nf = load_no_file()
+        if old in nf["names"]:
+            nf["names"] = sorted((set(nf["names"]) - {old}) | {new})
+        for v in nf["values"].values():
+            if v.get("name") == old:
+                v["name"] = new
+        save_no_file(nf)
+        settings = load_settings()
+        if old in settings["popup_secrets"]:
+            settings["popup_secrets"][new] = settings["popup_secrets"].pop(old)
+            save_settings(settings)
+
+
 def has_always(project: str, name: str) -> bool:
     return name in load_approvals().get(project, [])
 
@@ -1178,7 +1253,7 @@ def cmd_set(args) -> int:
     if not parts:
         return fail(tr("Give an entry name, e.g. Hosting/Database."), EXIT_NOT_FOUND)
     if args.field.lower() == "title":
-        return fail(tr("Field 'title' is the entry name; change it in KeePassXC."), EXIT_NOT_FOUND)
+        return fail(tr("Field 'title' is the entry name; rename the entry in the Secrets window."), EXIT_NOT_FOUND)
 
     changes = []
     if args.generate:
@@ -1416,6 +1491,19 @@ def cmd_cache(args) -> int:
     return 0
 
 
+def cmd_open(_args) -> int:
+    """Asks the tray to show the Secrets window; values stay on screen, nothing reaches stdout."""
+    import vault_cache
+    if not ensure_tray():
+        return fail(tr("The tray did not start."), EXIT_LOCKED)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if (vault_cache.request({"op": "show"}) or {}).get("ok"):
+            return 0
+        time.sleep(0.2)
+    return fail(tr("The tray did not answer."), EXIT_LOCKED)
+
+
 def cmd_tray(_args) -> int:
     import tray
     return tray.main()
@@ -1451,18 +1539,11 @@ def cmd_delete(args) -> int:
             audit(project=project, action="delete", secret=name, decision="ok" if ok else "deny", reason=args.reason, comment=comment)
             if not ok:
                 return refuse(tr("The user refused the deletion."), comment)
-            kp.trash_entry(entry)
+            trash_entry(kp, entry)
             save_vault(kp)
     except Locked as e:
         return fail(str(e), EXIT_LOCKED)
-    for p in {*load_approvals(), *load_day_approvals()}:
-        revoke(p, name)
-    with state_lock():
-        data = load_no_file()
-        if name in data["names"]:
-            data["names"] = [n for n in data["names"] if n != name]
-            data["values"] = {k: v for k, v in data["values"].items() if v.get("name") != name}
-            save_no_file(data)
+    drop_secret_state(name)
     print(tr("Moved {name} to the Recycle Bin.", name=name), file=sys.stderr)
     return 0
 
@@ -1590,12 +1671,13 @@ def main(argv: list[str] | None = None) -> int:
     p_mode.add_argument("--write", action="store_true", help=tr("the mode for saving (set) instead of reading (get)"))
     p_cache = sub.add_parser("cache", help=tr("in-memory vault cache in the tray: status, off, clear (turn it on in the tray menu)"))
     p_cache.add_argument("action", nargs="?", choices=["status", "off", "clear"], default="status")
+    sub.add_parser("open", help=tr("open the Secrets window (browse, edit, unlock the vault)"))
     sub.add_parser("tray", help=tr("tray icon: mode, history, approvals"))
     sub.add_parser("guard-hook", help=tr("Claude Code PreToolUse hook: blocks writing no-file secrets to files"))
     args = parser.parse_args(argv)
 
     return {"list": cmd_list, "get": cmd_get, "set": cmd_set, "ask": cmd_ask, "init": cmd_init, "approvals": cmd_approvals, "forget": cmd_forget, "delete": cmd_delete,
-            "mode": cmd_mode, "cache": cmd_cache, "tray": cmd_tray, "guard-hook": cmd_guard_hook}[args.cmd](args)
+            "mode": cmd_mode, "cache": cmd_cache, "open": cmd_open, "tray": cmd_tray, "guard-hook": cmd_guard_hook}[args.cmd](args)
 
 
 if __name__ == "__main__":
