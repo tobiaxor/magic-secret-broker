@@ -525,6 +525,10 @@ class Window:
 def main() -> int:
     import tkinter as tk
 
+    if sb.tray_running() or vault_cache.leave_launcher([str(Path(sb.__file__).resolve()), "tray"]):
+        return 0
+    vault_cache.harden_process()
+
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     mutex = k32.CreateMutexW(None, False, sb.TRAY_MUTEX)
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS

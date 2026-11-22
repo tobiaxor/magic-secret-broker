@@ -4,10 +4,13 @@ import ctypes
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import types
 from ctypes import wintypes
+from pathlib import Path
 
 import secret_broker as sb
 
@@ -79,6 +82,41 @@ def _user_only_sa() -> _SA:
     if not _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(f"D:P(A;;GA;;;{_user_sid()})", 1, ctypes.byref(sd), None):
         raise ctypes.WinError(ctypes.get_last_error())
     return _SA(ctypes.sizeof(_SA), sd, False)
+
+
+def leave_launcher(argv: list[str]) -> bool:
+    """A venv's python.exe is a launcher that stays alive as our parent with a full-access handle to us, which would
+    undo harden_process. Start again straight from the base interpreter; True means the caller should exit."""
+    base = getattr(sys, "_base_executable", None)
+    if os.environ.get("SECRET_BROKER_DIRECT") or not base or os.path.normcase(base) == os.path.normcase(sys.executable):
+        return False
+    exe = Path(base).with_name(Path(sys.executable).name)
+    env = {**os.environ, "__PYVENV_LAUNCHER__": sys.executable, "SECRET_BROKER_DIRECT": "1"}
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.Popen([str(exe if exe.exists() else base), "-E", "-s", *argv], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags, env=env)
+    except OSError:
+        return False
+    return True
+
+
+def harden_process() -> bool:
+    """Other processes of this user can no longer read or write this one's memory, debug it or get a crash dump of it."""
+    # This user: wait, query, terminate. Owner rights: READ_CONTROL only, which takes away the owner's implicit WRITE_DAC.
+    sddl = f"D:P(A;;0x101001;;;{_user_sid()})(A;;0x20000;;;OW)"
+    sd = ctypes.c_void_p()
+    if not _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(sd), None):
+        return False
+    _k32.GetCurrentProcess.restype = wintypes.HANDLE
+    _adv.SetKernelObjectSecurity.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p]
+    _k32.LocalFree.argtypes = [ctypes.c_void_p]
+    try:
+        ok = bool(_adv.SetKernelObjectSecurity(_k32.GetCurrentProcess(), 4, sd))  # DACL_SECURITY_INFORMATION
+    finally:
+        _k32.LocalFree(sd)
+    _k32.SetErrorMode(0x0001 | 0x0002)  # no fault dialog, so Windows Error Reporting writes no dump
+    return ok
 
 
 def cache_hours() -> float:

@@ -142,7 +142,9 @@ It is **not** a security boundary against an agent that runs arbitrary commands 
 - edit the approval, settings and audit files, run from another project's directory, or click the approval window;
 - send keystrokes to an unlocked Secrets window (select an entry, copy) and read the clipboard; the log then shows the copy as made by you;
 - stop or impersonate the tray icon, or replace the broker's scripts, venv or shims;
-- ask the vault cache's pipe for any entry while the cache is on, or read the decrypted values (and, while the Secrets window is unlocked, the master password) from the tray's memory.
+- ask the vault cache's pipe for any entry while the cache is on, or, with administrator rights, read the decrypted values (and, while the Secrets window is unlocked, the master password) from the tray's memory.
+
+The tray denies other processes of your user access to its memory (read, write, debug, thread injection) and restarts itself outside the venv launcher, which would otherwise keep an open handle to it. That closes one door only: it matters mostly when the master password is **not** remembered in Credential Manager, and Python cannot wipe a secret from memory after use, so values may linger in the tray until it exits.
 
 The audit log and notifications are informational, not tamper-proof. `no-file` is a lint for mistakes: encoded, split or indirect writes are not detected. Approvals cover a whole entry (all its fields), not a single field. The reason text comes from the agent; read it critically, and never type your master password into an `ask` window.
 
