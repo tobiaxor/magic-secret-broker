@@ -75,7 +75,7 @@ Double-click the tray icon (or run `secret-broker open`) to manage the vault you
 - **New entry** / **Edit**: name (`Group/Title`, renaming moves the entry and carries its approvals and `no-file` state over), username, password with a generator, URL, notes, any number of extra fields (each plain or secret) and the `no-file` tag;
 - **Delete** to the Recycle Bin (approvals revoked in every project); in the **Recycle Bin** view, restore to the original group, delete permanently or empty the bin. Right-click a group to rename it or delete it when empty.
 
-The window unlocks with the remembered master password, or asks for it (and can remember it); with no vault yet, it creates one. **Lock** (Ctrl+L), closing the window or 10 minutes without activity drop the decrypted vault and the password from memory and clear a copied value; **Forget the remembered password** on the locked screen removes it from Credential Manager. Every write takes the same lock as the CLI and is made on the file as it is on disk, so a save by an agent in the meantime is never lost; while an agent's window holds the vault, the Secrets window says so and saves nothing. Changes appear in the tray history as made "by you".
+Opened from the tray, the window unlocks with the remembered master password, or asks for it (and can remember it); with no vault yet, it creates one. Opened with `secret-broker open`, which any process can run, it stays locked until you click **Use the remembered password** or type it. The window is excluded from screenshots, recordings and screen sharing. **Lock** (Ctrl+L), closing the window or 10 minutes without activity drop the decrypted vault and the password from memory and clear a copied value; **Forget the remembered password** on the locked screen removes it from Credential Manager. Every write takes the same lock as the CLI and is made on the file as it is on disk, so a save by an agent in the meantime is never lost; if the entry you are editing was itself changed meanwhile, the save is refused and you reopen it. While an agent's window holds the vault, the Secrets window says so and saves nothing. A new, renamed or restored entry never inherits approvals left under its name by an earlier entry. Changes appear in the tray history as made "by you".
 
 ![Secrets window](docs/images/secrets-main.png)
 ![edit entry](docs/images/secrets-edit.png)
@@ -140,6 +140,7 @@ It is **not** a security boundary against an agent that runs arbitrary commands 
 
 - read the remembered master password from Windows Credential Manager and open the vault directly, with no window and no log entry;
 - edit the approval, settings and audit files, run from another project's directory, or click the approval window;
+- send keystrokes to an unlocked Secrets window (select an entry, copy) and read the clipboard; the log then shows the copy as made by you;
 - stop or impersonate the tray icon, or replace the broker's scripts, venv or shims;
 - ask the vault cache's pipe for any entry while the cache is on, or read the decrypted values (and, while the Secrets window is unlocked, the master password) from the tray's memory.
 

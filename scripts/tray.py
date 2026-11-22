@@ -631,7 +631,7 @@ def main() -> int:
                 pass
 
     threading.Thread(target=poll_loop, daemon=True).start()
-    threading.Thread(target=vault_cache.serve, kwargs={"on_show": lambda: calls.put(secrets_window.show)}, daemon=True).start()
+    threading.Thread(target=vault_cache.serve, kwargs={"on_show": lambda: calls.put(lambda: secrets_window.show(by_user=False))}, daemon=True).start()
     root.after(100, pump)
     root.mainloop()
     k32.CloseHandle(mutex)

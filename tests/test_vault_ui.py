@@ -146,8 +146,65 @@ try:
     check("busy vault reported", err and "busy" in err.lower())
     holder.wait()
 
+    # Grants left under a name by an entry that is gone must not pass to a new entry of that name.
+    sb.grant_always("C:/proj", "Stale/Name")
+    plain = {**spec, "name": "Stale/Name", "no_file": False, "custom": []}
+    check("new entry saved under a stale name", w.save_entry(None, plain) is None)
+    check("stale approval not inherited", "C:/proj" not in sb.load_approvals())
+    sb.grant_always("C:/proj", "Stale/Target")
+    sb.grant_always("C:/proj3", "Stale/Name")
+    suid = by_name(disk(), "Stale/Name").uuid.hex
+    check("rename onto a stale name", w.save_entry(suid, {**plain, "name": "Stale/Target"}) is None)
+    check("rename replaces the target's grants", sb.load_approvals() == {"C:/proj3": ["Stale/Target"]})
+
+    # The dialog loaded the entry, then an agent rotated the password.
+    base = ui._spec(by_name(disk(), "Stale/Target"))
+    other = disk()
+    by_name(other, "Stale/Target").password = "rotated-by-agent"
+    sb.save_vault(other)
+    err = w.save_entry(suid, {**base, "url": "https://new"}, base)
+    check("stale dialog refused", err and by_name(disk(), "Stale/Target").password == "rotated-by-agent")
+
+    check("field name with a quote refused", w.save_entry(None, {**plain, "name": "Q/X", "custom": [('a" or "b', "v", False)]})
+          and by_name(disk(), "Q/X") is None)
+
+    # An agent puts an entry into a group while its "delete this empty group?" question is open.
+    kp0 = disk()
+    sb.ensure_group(kp0, ["EmptyG"])
+    sb.save_vault(kp0)
+    w.session.reload_if_changed()
+    w.trash_var.set(False)
+    w._mode_changed()
+    gid = "g" + next(g for g in w.session.kp.root_group.subgroups if g.name == "EmptyG").uuid.hex
+    w.tree.selection_set(gid)
+    w._selection_changed()
+    other = disk()
+    other.add_entry(sb.ensure_group(other, ["EmptyG"]), "Late", "", "late-pw")
+    sb.save_vault(other)
+    warnings.clear()
+    w._delete_group()
+    check("group with a late entry kept", by_name(disk(), "EmptyG/Late") is not None and len(warnings) == 1)
+    warnings.clear()
+
+    try:
+        w.session.create("another-pw", remember=False)
+        refused = False
+    except ValueError:
+        refused = True
+    check("create never replaces a vault", refused and by_name(disk(), "EmptyG/Late") is not None)
+
+    w.close()
+    sb._kr_set(str(sb.KDBX_PATH), PW)
+    try:
+        w.show(by_user=False)
+        check("open from the CLI shows it locked", not w.session.unlocked)
+    finally:
+        sb._kr_del(str(sb.KDBX_PATH))
+    w.session.unlock(PW, remember=False)
+    w.render()
+
     w.lock()
-    check("lock drops the session", not w.session.unlocked and w.session.password is None)
+    check("lock drops the session", not w.session.unlocked and w.session.password is None and not w.items)
     w.session.unlock(PW, remember=False)
     w.render()
     check("unlock again", w.session.unlocked)

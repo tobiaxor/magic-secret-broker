@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 from ctypes import wintypes
@@ -710,6 +711,10 @@ def save_vault(kp):
     return fresh
 
 
+def valid_field_name(key: str) -> bool:
+    return bool(key) and '"' not in key and all(c.isprintable() for c in key)
+
+
 def ensure_group(kp, parts: list[str]):
     group = kp.root_group
     for part in parts:
@@ -895,18 +900,20 @@ def project_root(path: str) -> str:
     return str(Path(path).resolve())
 
 
-_held: dict[str, int] = {}
+_held: dict[tuple[int, str], int] = {}
 
 
 @contextlib.contextmanager
 def file_lock(name: str, timeout: float):
     """Several agents can run the broker at once; one writer at a time per lock. Reentrant within a process."""
-    if _held.get(name):
-        _held[name] += 1
+    # Keyed by thread: the tray writes state from both the Tk and the menu thread, and one must not ride on the other's lock.
+    key = (threading.get_ident(), name)
+    if _held.get(key):
+        _held[key] += 1
         try:
             yield
         finally:
-            _held[name] -= 1
+            _held[key] -= 1
         return
     import msvcrt
 
@@ -923,11 +930,11 @@ def file_lock(name: str, timeout: float):
                 f.close()
                 raise Locked(tr("Another secret-broker process is busy; try again."))
             time.sleep(0.1)
-    _held[name] = 1
+    _held[key] = 1
     try:
         yield
     finally:
-        _held[name] = 0
+        _held.pop(key, None)
         f.seek(0)
         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
         f.close()
@@ -1000,6 +1007,10 @@ def drop_secret_state(name: str) -> None:
     for p in {*load_approvals(), *load_day_approvals()}:
         revoke(p, name)
     forget_no_file(name)
+    with state_lock():
+        settings = load_settings()
+        if settings["popup_secrets"].pop(name, None) is not None:
+            save_settings(settings)
 
 
 def forget_no_file(name: str) -> None:
@@ -1016,6 +1027,7 @@ def rename_secret_state(old: str, new: str) -> None:
     if old == new:
         return
     with state_lock():
+        drop_secret_state(new)
         always = load_approvals()
         for p, names in always.items():
             if old in names:
@@ -1255,6 +1267,11 @@ def cmd_set(args) -> int:
     if args.field.lower() == "title":
         return fail(tr("Field 'title' is the entry name; rename the entry in the Secrets window."), EXIT_NOT_FOUND)
 
+    # pykeepass builds an XPath from the field name without escaping it.
+    for key in [args.field, *[kv.partition("=")[0] for kv in args.attr or []]]:
+        if not valid_field_name(key):
+            return fail(tr("The field name {key} has characters that are not allowed.", key=repr(key)), EXIT_NOT_FOUND)
+
     changes = []
     if args.generate:
         changes.append({"field": args.field, "value": generate_password(args.generate), "sensitive": True})
@@ -1320,6 +1337,8 @@ def _set_locked(args, parts, name, project, changes) -> int:
         print(tr("No change: no-file was not ticked."), file=sys.stderr)
         return 0
     if entry is None:
+        # Grants left behind by an earlier entry of this name must not pass to a new secret.
+        drop_secret_state(name)
         entry = kp.add_entry(ensure_group(kp, parts[:-1]), parts[-1], "", "")
     else:
         entry.save_history()
@@ -1377,6 +1396,9 @@ def cmd_ask(args) -> int:
 
 
 def _ask_locked(args, parts, name, project, fields, attrs) -> int:
+    for key in [*fields, *[k for k, _v in attrs]]:
+        if not valid_field_name(key):
+            return fail(tr("The field name {key} has characters that are not allowed.", key=repr(key)), EXIT_NOT_FOUND)
     kp = open_vault(project, for_write=True)
     entry = vault_entries(kp).get(name)
     locked = entry is not None and is_no_file(entry)
@@ -1390,6 +1412,7 @@ def _ask_locked(args, parts, name, project, fields, attrs) -> int:
         return refuse(tr("The user cancelled entering the secret."), comment)
 
     if entry is None:
+        drop_secret_state(name)
         entry = kp.add_entry(ensure_group(kp, parts[:-1]), parts[-1], "", "")
     else:
         entry.save_history()

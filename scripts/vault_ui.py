@@ -13,7 +13,8 @@ from secret_broker import tr
 IDLE_LOCK_S = 10 * 60
 CLIPBOARD_CLEAR_S = 30
 TICK_MS = 3000
-RESERVED = {"title", "username", "password", "url", "notes"}
+RESERVED = {"title", "username", "password", "url", "notes", "tags", "iconid", "times", "history", "otp"}
+WDA_EXCLUDEFROMCAPTURE = 0x11
 
 _u32 = ctypes.WinDLL("user32", use_last_error=True)
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -27,15 +28,32 @@ for _fn, _args, _res in (
     (_k32.GlobalAlloc, [wintypes.UINT, ctypes.c_size_t], ctypes.c_void_p),
     (_k32.GlobalLock, [ctypes.c_void_p], ctypes.c_void_p),
     (_k32.GlobalUnlock, [ctypes.c_void_p], wintypes.BOOL),
+    (_k32.GlobalFree, [ctypes.c_void_p], ctypes.c_void_p),
+    (_u32.GetParent, [wintypes.HWND], wintypes.HWND),
+    (_u32.SetWindowDisplayAffinity, [wintypes.HWND, wintypes.DWORD], wintypes.BOOL),
 ):
     _fn.argtypes, _fn.restype = _args, _res
 
 
-def _global(data: bytes):
+def hide_from_capture(top) -> None:
+    """Screenshots, recordings and screen sharing show the window as a black box."""
+    top.update_idletasks()
+    _u32.SetWindowDisplayAffinity(_u32.GetParent(top.winfo_id()), WDA_EXCLUDEFROMCAPTURE)
+
+
+def _put(fmt: int, data: bytes) -> bool:
     h = _k32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
-    ctypes.memmove(_k32.GlobalLock(h), data, len(data))
+    ptr = _k32.GlobalLock(h) if h else None
+    if not ptr:
+        if h:
+            _k32.GlobalFree(h)
+        return False
+    ctypes.memmove(ptr, data, len(data))
     _k32.GlobalUnlock(h)
-    return h
+    if not _u32.SetClipboardData(fmt, h):
+        _k32.GlobalFree(h)
+        return False
+    return True
 
 
 def _open_clipboard() -> bool:
@@ -52,14 +70,17 @@ def copy_secret(text: str) -> int | None:
         return None
     try:
         _u32.EmptyClipboard()
-        _u32.SetClipboardData(13, _global((text + "\0").encode("utf-16-le")))  # CF_UNICODETEXT
-        for fmt, data in (("ExcludeClipboardContentFromMonitorProcessing", b"\0"),
-                          ("CanIncludeInClipboardHistory", b"\0\0\0\0"),
-                          ("CanUploadToCloudClipboard", b"\0\0\0\0")):
-            _u32.SetClipboardData(_u32.RegisterClipboardFormatW(fmt), _global(data))
+        # The markers go first: without them the value must not reach the clipboard at all.
+        ok = all(_put(_u32.RegisterClipboardFormatW(fmt), data) for fmt, data in (
+            ("ExcludeClipboardContentFromMonitorProcessing", b"\0"),
+            ("CanIncludeInClipboardHistory", b"\0\0\0\0"),
+            ("CanUploadToCloudClipboard", b"\0\0\0\0")))
+        ok = ok and _put(13, (text + "\0").encode("utf-16-le"))  # CF_UNICODETEXT
+        if not ok:
+            _u32.EmptyClipboard()
     finally:
         _u32.CloseClipboard()
-    return _u32.GetClipboardSequenceNumber()
+    return _u32.GetClipboardSequenceNumber() if ok else None
 
 
 def clear_clipboard(seq: int | None) -> None:
@@ -87,6 +108,10 @@ class Busy(Exception):
     pass
 
 
+class NoChange(Exception):
+    pass
+
+
 class Session:
     """The open vault and its password, held only while the window is unlocked."""
 
@@ -104,8 +129,17 @@ class Session:
         from pykeepass import PyKeePass
         return PyKeePass(str(sb.KDBX_PATH), password=password, keyfile=sb.KEYFILE)
 
-    def _set(self, kp, password) -> None:
-        self.kp, self.password, self.sig = kp, password, _signature()
+    def _load(self, password: str) -> None:
+        # The signature is taken before the read and must still hold after it: opening takes about a second, and a
+        # signature newer than the contents would let the next write overwrite an agent's save.
+        for _ in range(5):
+            sig = _signature()
+            kp = self._open(password)
+            if _signature() == sig:
+                break
+        else:
+            raise Busy(tr("The vault keeps changing on disk; try again."))
+        self.kp, self.password, self.sig = kp, password, sig
 
     @staticmethod
     def remembered() -> bool:
@@ -117,10 +151,9 @@ class Session:
         sb._kr_set(_tk_user(), base64.b64encode(kp.transformed_key).decode())
 
     def unlock(self, password: str, remember: bool) -> None:
-        kp = self._open(password)
+        self._load(password)
         if remember:
-            self.remember(kp, password)
-        self._set(kp, password)
+            self.remember(self.kp, password)
 
     def unlock_remembered(self) -> bool:
         from pykeepass.exceptions import CredentialsError
@@ -129,7 +162,7 @@ class Session:
         if pw is None or not sb.KDBX_PATH.exists():
             return False
         try:
-            self._set(self._open(pw), pw)
+            self._load(pw)
         except CredentialsError:
             sb._kr_del(str(sb.KDBX_PATH))
             return False
@@ -139,10 +172,18 @@ class Session:
         from pykeepass import create_database
 
         sb.KDBX_PATH.parent.mkdir(parents=True, exist_ok=True)
-        kp = create_database(str(sb.KDBX_PATH), password=password, keyfile=sb.KEYFILE)
+        tmp = sb.KDBX_PATH.with_name(sb.KDBX_PATH.name + ".new")
+        with sb.file_lock("vault", 3):
+            create_database(str(tmp), password=password, keyfile=sb.KEYFILE)
+            try:
+                # On Windows a rename refuses to replace: a vault that appeared meanwhile is never overwritten.
+                tmp.rename(sb.KDBX_PATH)
+            except FileExistsError:
+                tmp.unlink()
+                raise ValueError(tr("The vault already exists: {path}", path=sb.KDBX_PATH))
+        self._load(password)
         if remember:
-            self.remember(kp, password)
-        self._set(kp, password)
+            self.remember(self.kp, password)
 
     def lock(self) -> None:
         self.kp = self.password = self.sig = None
@@ -150,25 +191,35 @@ class Session:
     def reload_if_changed(self) -> bool:
         if self.kp is None or _signature() == self.sig:
             return False
-        self._set(self._open(self.password), self.password)
+        self._load(self.password)
         return True
 
-    def modify(self, fn):
-        """One write: under the CLI's vault lock, on the file as it is now, so an agent's save in between is never lost."""
+    def modify(self, fn, after=None):
+        """One write: under the CLI's vault lock, on the file as it is now, so an agent's save in between is never lost.
+
+        `after(result)` runs under the same lock once the file is written: state keyed by entry name moves with the entry.
+        """
+        if self.password is None:
+            raise Busy(tr("The vault is locked"))
         try:
             lock = sb.file_lock("vault", 3)
             lock.__enter__()
         except sb.Locked:
             raise Busy(tr("The vault is busy: a window from an agent is open. Close it and try again."))
         try:
-            kp = self.kp if _signature() == self.sig else self._open(self.password)
+            if _signature() != self.sig:
+                self._load(self.password)
             try:
-                result = fn(kp)
-                fresh = sb.save_vault(kp)
+                result = fn(self.kp)
+                fresh = sb.save_vault(self.kp)
+            except NoChange:
+                return None
             except Exception:
-                self._set(self._open(self.password), self.password)
+                self._load(self.password)
                 raise
-            self._set(fresh, self.password)
+            self.kp, self.sig = fresh, _signature()
+            if after is not None:
+                after(result)
             return result
         finally:
             lock.__exit__(None, None, None)
@@ -226,6 +277,7 @@ class SecretsWindow:
         self.clip_after = None
         self.last_activity = time.time()
         self.dialogs = 0
+        self.modals: list = []
         self.revealed: set[str] = set()
         self.selected: str | None = None
         self.items: dict[str, tuple[str, object]] = {}
@@ -236,17 +288,20 @@ class SecretsWindow:
 
     # ---------- window ----------
 
-    def show(self) -> None:
+    def show(self, by_user: bool = True) -> None:
+        """`by_user` is False for `secret-broker open`: any process can send that, so it never unlocks or takes the keyboard."""
         if self.win is not None and self.win.winfo_exists():
             self.win.deiconify()
             self.win.lift()
-            self.win.focus_force()
+            if by_user:
+                self.win.focus_force()
             self._reload_if_changed()
             return
         self.build()
-        if not self.session.unlocked:
+        if by_user and not self.session.unlocked:
             try:
-                self.session.unlock_remembered()
+                if self.session.unlock_remembered():
+                    sb.audit(action="unlock", vault=str(sb.KDBX_PATH), decision="ok-tray", remembered=True)
             except Exception as e:  # noqa: BLE001 - a broken vault file must still show the window with the error
                 self.status(str(e))
         self.render()
@@ -261,6 +316,7 @@ class SecretsWindow:
         w.geometry(f"{self.px(1100)}x{self.px(680)}")
         w.minsize(self.px(760), self.px(460))
         w.protocol("WM_DELETE_WINDOW", self.close)
+        hide_from_capture(w)
 
         style = ttk.Style(w)
         style.configure("Secrets.Treeview", font=(sb.FONT, 10), rowheight=self.px(26))
@@ -308,11 +364,11 @@ class SecretsWindow:
     def _tick(self) -> None:
         if self.win is None or not self.win.winfo_exists():
             return
-        if self.session.unlocked and not self.dialogs:
+        if self.session.unlocked:
             if time.time() - self.last_activity > IDLE_LOCK_S:
                 self.lock()
                 self.status(tr("Locked after {m} minutes without activity.", m=IDLE_LOCK_S // 60))
-            else:
+            elif not self.dialogs:
                 self._reload_if_changed()
         self.win.after(TICK_MS, self._tick)
 
@@ -328,9 +384,12 @@ class SecretsWindow:
             self.status(str(e))
 
     def lock(self, render: bool = True) -> None:
+        for m in list(self.modals):
+            m.close()
         self.session.lock()
         self.revealed.clear()
         self.selected = None
+        self.items = {}
         clear_clipboard(self.clip_seq)
         self.clip_seq = None
         if render and self.win is not None and self.win.winfo_exists():
@@ -388,7 +447,11 @@ class SecretsWindow:
                     return error.set(tr("The password must have at least 8 characters."))
                 if pw1.get() != pw2.get():
                     return error.set(tr("The passwords do not match."))
-                self.session.create(pw1.get(), remember.get())
+                try:
+                    self.session.create(pw1.get(), remember.get())
+                except (ValueError, sb.Locked) as e:
+                    error.set(str(e))
+                    return self.win.after(1500, self.render)
                 sb.audit(action="init", vault=str(sb.KDBX_PATH), decision="ok-tray")
                 self.render()
 
@@ -428,6 +491,7 @@ class SecretsWindow:
         if sb.KDBX_PATH.exists() and Session.remembered():
             def remembered():
                 if self.session.unlock_remembered():
+                    sb.audit(action="unlock", vault=str(sb.KDBX_PATH), decision="ok-tray", remembered=True)
                     self.render()
                 else:
                     error.set(tr("The remembered password no longer opens the vault."))
@@ -666,6 +730,7 @@ class SecretsWindow:
                             wrap="word", padx=self.px(8), pady=self.px(6))
             notes.insert("1.0", e.notes)
             notes.configure(state="disabled")
+            self.guard_copy(notes)
             notes.pack(fill="x")
 
         grants = []
@@ -712,16 +777,38 @@ class SecretsWindow:
         value = sb.entry_value(e, key)
         if not value:
             return self.status(tr("This entry has no {field}.", field=key))
-        if self.clip_after:
-            self.win.after_cancel(self.clip_after)
-        self.clip_seq = copy_secret(value)
-        if self.clip_seq is None:
-            return self.status(tr("The clipboard is busy; try again."))
+        if not self._to_clipboard(value):
+            return
         sensitive = key == "password" or (key in e.custom_properties and e.is_custom_property_protected(key))
         if sensitive:
             sb.audit(project="*", action="copy", secret=name, field=key, decision="ok-tray")
-        self.clip_after = self.win.after(CLIPBOARD_CLEAR_S * 1000, self._clear_clipboard)
         self.status(tr("Copied {field} of {name}; the clipboard clears in {s} s.", field=key, name=name, s=CLIPBOARD_CLEAR_S))
+
+    def _to_clipboard(self, value: str) -> bool:
+        seq = copy_secret(value)
+        if seq is None:
+            # The earlier copy keeps its timer, so it is still cleared.
+            self.status(tr("The clipboard is busy; try again."))
+            return False
+        if self.clip_after:
+            self.win.after_cancel(self.clip_after)
+        self.clip_seq = seq
+        self.clip_after = self.win.after(CLIPBOARD_CLEAR_S * 1000, self._clear_clipboard)
+        return True
+
+    def guard_copy(self, widget) -> None:
+        """Tk's own copy would skip the history exclusion and the timed clear."""
+        def copy(ev, cut=False):
+            try:
+                text = ev.widget.selection_get()
+            except self.tk.TclError:
+                return "break"
+            if self._to_clipboard(text) and cut:
+                ev.widget.delete("sel.first", "sel.last")
+            return "break"
+
+        widget.bind("<<Copy>>", copy)
+        widget.bind("<<Cut>>", lambda ev: copy(ev, cut=True))
 
     def _clear_clipboard(self) -> None:
         clear_clipboard(self.clip_seq)
@@ -730,11 +817,11 @@ class SecretsWindow:
 
     # ---------- writes ----------
 
-    def _write(self, fn, done: str | None = None):
+    def _write(self, fn, done: str | None = None, after=None):
         """Returns fn's result, or None after showing why the write failed."""
         from tkinter import messagebox
         try:
-            result = self.session.modify(fn)
+            result = self.session.modify(fn, after)
         except (Busy, ValueError, sb.Locked) as e:
             messagebox.showwarning(tr("Secrets"), str(e), parent=self.win)
             return None
@@ -759,12 +846,18 @@ class SecretsWindow:
             return
         EntryDialog(self, e.uuid.hex, _spec(e))
 
-    def save_entry(self, uid: str | None, spec: dict) -> str | None:
-        """Called by the dialog; returns an error to show there, or None when saved."""
+    def save_entry(self, uid: str | None, spec: dict, base: dict | None = None) -> str | None:
+        """Called by the dialog; returns an error to show there, or None when saved. `base` is the entry as the dialog loaded it."""
         parts = [p.strip() for p in spec["name"].split("/") if p.strip()]
         if not parts:
             return tr("Give the entry a name, e.g. Hosting/Database.")
         name = "/".join(parts)
+        # A name the dialog did not touch stays as it is, even where the vault spells it differently (spaces, a slash in a title).
+        if base is not None and spec["name"] == base["name"]:
+            name = base["name"]
+        for k, _v, _p in spec["custom"]:
+            if k.lower() in RESERVED or not sb.valid_field_name(k):
+                return tr("The field name {key} has characters that are not allowed.", key=repr(k))
 
         def apply(kp):
             recycle = kp.recyclebin_group
@@ -774,19 +867,24 @@ class SecretsWindow:
             entry = _find(kp, uid) if uid else None
             if uid and entry is None:
                 raise ValueError(tr("The entry no longer exists (deleted elsewhere?)."))
+            if entry is not None and sb.in_trash(kp, entry):
+                raise ValueError(tr("The entry no longer exists (deleted elsewhere?)."))
             old = _spec(entry) if entry is not None else None
+            if old is not None and base is not None and not _same(old, base):
+                raise ValueError(tr("The entry was changed elsewhere while this window was open. Close it and open the entry again."))
             if old is not None and _same(old, {**spec, "name": name}):
-                return None
+                raise NoChange
             if name in names and (entry is None or names[name].uuid != entry.uuid):
                 raise ValueError(tr("Another entry is already called {name}.", name=name))
             if entry is None:
                 entry = kp.add_entry(sb.ensure_group(kp, parts[:-1]), parts[-1], "", "", force_creation=True)
             else:
                 entry.save_history()
-                target = sb.ensure_group(kp, parts[:-1])
-                if target != entry.group:
-                    kp.move_entry(entry, target)
-                entry.title = parts[-1]
+                if name != old["name"]:
+                    target = sb.ensure_group(kp, parts[:-1])
+                    if target != entry.group:
+                        kp.move_entry(entry, target)
+                    entry.title = parts[-1]
             entry.username, entry.password, entry.url, entry.notes = spec["username"], spec["password"], spec["url"], spec["notes"]
             keep = {k for k, _v, _p in spec["custom"]}
             for k in list(entry.custom_properties):
@@ -800,8 +898,21 @@ class SecretsWindow:
             changed += sorted({k for k, _v, _p in set(spec["custom"]) ^ set(old["custom"] if old else [])})
             return {"old": old["name"] if old else None, "fields": changed, "no_file_was": bool(old and old["no_file"])}
 
+        def state(res):
+            if res["old"] is None:
+                sb.drop_secret_state(name)
+            elif res["old"] != name:
+                sb.rename_secret_state(res["old"], name)
+            if spec["no_file"]:
+                with sb.state_lock():
+                    sb.remember_no_file(names=sorted(set(sb.load_no_file()["names"]) | {name}))
+                for v in _sensitive_values(spec):
+                    sb.remember_no_file(value=(name, v))
+            elif res["no_file_was"]:
+                sb.forget_no_file(name)
+
         try:
-            res = self.session.modify(apply)
+            res = self.session.modify(apply, state)
         except (Busy, ValueError, sb.Locked) as e:
             return str(e)
         except Exception as e:  # noqa: BLE001
@@ -809,14 +920,6 @@ class SecretsWindow:
         if res is None:
             self.status(tr("No change."))
             return None
-        if res["old"] and res["old"] != name:
-            sb.rename_secret_state(res["old"], name)
-        if spec["no_file"]:
-            sb.remember_no_file(names=sorted(set(sb.load_no_file()["names"]) | {name}))
-            for v in _sensitive_values(spec):
-                sb.remember_no_file(value=(name, v))
-        elif res["no_file_was"]:
-            sb.forget_no_file(name)
         sb.audit(project="*", action="edit" if res["old"] else "create", secret=name, fields=res["fields"], decision="ok-tray",
                  **({"renamed_from": res["old"]} if res["old"] and res["old"] != name else {}))
         found = sb.vault_entries(self.session.kp).get(name)
@@ -837,8 +940,8 @@ class SecretsWindow:
         if not messagebox.askyesno(tr("Delete"), tr("Move {name} to the Recycle Bin? Its approvals are revoked in every project.", name=name),
                                    parent=self.win):
             return
-        if self._write(lambda kp: sb.trash_entry(kp, _find(kp, uid)) or True, tr("Moved {name} to the Recycle Bin.", name=name)):
-            sb.drop_secret_state(name)
+        if self._write(lambda kp: sb.trash_entry(kp, _find(kp, uid)) or True, tr("Moved {name} to the Recycle Bin.", name=name),
+                       after=lambda _r: sb.drop_secret_state(name)):
             sb.audit(project="*", action="trash", secret=name, decision="ok-tray")
             self.populate()
 
@@ -861,7 +964,7 @@ class SecretsWindow:
             entry.touch(modify=True)
             return name
 
-        name = self._write(apply)
+        name = self._write(apply, after=sb.drop_secret_state)
         if name:
             sb.audit(project="*", action="restore", secret=name, decision="ok-tray")
             self.populate()
@@ -902,7 +1005,16 @@ class SecretsWindow:
             return self.status(tr("Only an empty group can be deleted; move or delete its entries first."))
         uid, path = g.uuid, _group_path(g)
         if messagebox.askyesno(tr("Delete"), tr("Delete the empty group {name}?", name=path), parent=self.win):
-            if self._write(lambda kp: kp.delete_group(kp.find_groups(uuid=uid, first=True)) or True, tr("Deleted the group {name}.", name=path)):
+            def apply(kp):
+                group = kp.find_groups(uuid=uid, first=True)
+                if group is None:
+                    raise NoChange
+                if group.entries or group.subgroups:
+                    raise ValueError(tr("Only an empty group can be deleted; move or delete its entries first."))
+                kp.delete_group(group)
+                return True
+
+            if self._write(apply, tr("Deleted the group {name}.", name=path)):
                 self.selected = None
                 self.populate()
 
@@ -930,10 +1042,13 @@ class SecretsWindow:
             group.name = new
             return {before[e.uuid]: sb.entry_name(e) for e in kp.entries if e.uuid in before}
 
-        renames = self._write(apply, tr("Renamed the group to {name}.", name=new))
-        if renames is not None:
+        def state(renames):
             for old, nn in renames.items():
                 sb.rename_secret_state(old, nn)
+
+        renames = self._write(apply, tr("Renamed the group to {name}.", name=new), after=state)
+        if renames is not None:
+            for old, nn in renames.items():
                 sb.audit(project="*", action="edit", secret=nn, renamed_from=old, fields=[], decision="ok-tray")
             self.populate()
 
@@ -975,11 +1090,15 @@ class SecretsWindow:
     # ---------- history ----------
 
     def show_history(self, uid: str) -> None:
+        if _find(self.session.kp, uid) is None:
+            return self.populate()
         HistoryDialog(self, uid)
 
     def restore_version(self, uid: str, index: int, mtime) -> str | None:
         def apply(kp):
             entry = _find(kp, uid)
+            if entry is None:
+                raise ValueError(tr("The entry no longer exists (deleted elsewhere?)."))
             hist = entry.history
             if index >= len(hist) or hist[index].mtime != mtime:
                 raise ValueError(tr("The vault changed meanwhile; open the history again."))
@@ -1022,6 +1141,8 @@ class _Modal:
         for seq in ("<Any-KeyPress>", "<Motion>"):
             top.bind(seq, owner._touch, add="+")
         owner.dialogs += 1
+        owner.modals.append(self)
+        hide_from_capture(top)
         self.body = tk.Frame(top, bg=sb.BG, padx=owner.px(20), pady=owner.px(16))
         self.body.pack(fill="both", expand=True)
         tk.Frame(top, bg=sb.BORDER, height=1).pack(fill="x")
@@ -1036,6 +1157,7 @@ class _Modal:
         e = self.tk.Entry(parent, textvariable=var, show=show, width=width, font=(sb.MONO if mono else sb.FONT, 11), relief="flat",
                           bg=sb.FOOTER_BG, fg=sb.FG, insertbackground=sb.FG, highlightthickness=1, highlightbackground=sb.BORDER,
                           highlightcolor=sb.THEMES["unlock"]["accent"])
+        self.owner.guard_copy(e)
         return var, e
 
     def place(self):
@@ -1048,10 +1170,12 @@ class _Modal:
         top.focus_force()
 
     def close(self):
-        if self.top.winfo_exists():
+        if self in self.owner.modals:
+            self.owner.modals.remove(self)
             self.owner.dialogs -= 1
-            self.top.grab_release()
-            self.top.destroy()
+            if self.top.winfo_exists():
+                self.top.grab_release()
+                self.top.destroy()
 
 
 class EntryDialog(_Modal):
@@ -1059,6 +1183,7 @@ class EntryDialog(_Modal):
         super().__init__(owner, tr("Edit entry") if uid else tr("New entry"))
         tk, ttk, px = self.tk, owner.ttk, owner.px
         self.uid = uid
+        self.base = spec if uid else None
         b = self.body
         b.columnconfigure(1, weight=1)
 
@@ -1089,6 +1214,7 @@ class EntryDialog(_Modal):
                              highlightthickness=1, highlightbackground=sb.BORDER, highlightcolor=sb.THEMES["unlock"]["accent"],
                              padx=px(6), pady=px(4))
         self.notes.insert("1.0", spec["notes"])
+        owner.guard_copy(self.notes)
         self.notes.grid(row=4, column=1, sticky="ew", pady=px(4))
 
         self.label(b, tr("OTHER FIELDS")).grid(row=5, column=0, sticky="nw", padx=(0, px(14)), pady=px(9))
@@ -1174,7 +1300,7 @@ class EntryDialog(_Modal):
             custom.append((k, v, r["prot"].get()))
         spec = {"name": self.name.get(), "username": self.username.get(), "password": self.password.get(), "url": self.url.get().strip(),
                 "notes": self.notes.get("1.0", "end-1c"), "custom": custom, "no_file": self.no_file.get()}
-        error = self.owner.save_entry(self.uid, spec)
+        error = self.owner.save_entry(self.uid, spec, self.base)
         if error:
             self.error.configure(text=error)
         else:
