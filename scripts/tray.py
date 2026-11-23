@@ -12,6 +12,7 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
+import keeper
 import secret_broker as sb
 import vault_cache
 import vault_ui
@@ -584,6 +585,24 @@ def main() -> int:
     def cache_label(hours):
         return tr("Off") if not hours else tr("{hours} h", hours=hours)
 
+    def toggle_hello(_i, _it):
+        def go():
+            from tkinter import messagebox
+            if sb.protected():
+                error = keeper.KEEPER.disable()
+            elif messagebox.askyesno(tr("Protect the master password with Windows Hello?"), tr(
+                    "The remembered master password will be encrypted with a Windows Hello key; Windows asks for your "
+                    "fingerprint, face or PIN up to three times now, and once after every start of the tray. From then on "
+                    "only the tray opens the vault and asks for approval.\n\nMake sure you know the master password: if "
+                    "Windows Hello is reset, the remembered copy is lost."), parent=root):
+                error = keeper.KEEPER.enable()
+            else:
+                return
+            if error:
+                messagebox.showwarning(tr("Windows Hello"), error, parent=root)
+            icon.update_menu()
+        calls.put(go)
+
     def quit_all(_i, _it):
         icon.stop()
         calls.put(lambda: (secrets_window.lock(render=False), root.destroy()))
@@ -603,6 +622,7 @@ def main() -> int:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(tr("Vault cache in memory"), pystray.Menu(*[
             pystray.MenuItem(cache_label(h), set_cache(h), checked=is_cache(h), radio=True) for h in vault_cache.HOUR_CHOICES])),
+        pystray.MenuItem(tr("Master password protected by Windows Hello"), toggle_hello, checked=lambda _it: sb.protected()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(tr("Quit"), quit_all),
     )
@@ -612,12 +632,37 @@ def main() -> int:
     tail = AuditTail()
 
     def pump():
+        # Scheduled first: a call may sit in a dialog for minutes, and the menu must keep working meanwhile.
         try:
-            while not calls.empty():
-                calls.get_nowait()()
             root.after(100, pump)
         except tk.TclError:
-            pass
+            return
+        while not calls.empty():
+            try:
+                calls.get_nowait()()
+            except Exception:  # noqa: BLE001 - one failed action must not stop the tray
+                pass
+
+    run_lock = threading.Lock()
+
+    def on_run(req: dict) -> dict:
+        done = threading.Event()
+        box = {}
+
+        def go():
+            try:
+                box["resp"] = keeper.run_command(req)
+            finally:
+                done.set()
+
+        with run_lock:
+            calls.put(go)
+            done.wait()
+        return box.get("resp") or {"ok": False, "reason": "error"}
+
+    sb.DIALOG_PARENT = root
+    sb.VAULT_PROVIDER = keeper.KEEPER.vault
+    keeper.KEEPER.pump = root.update
 
     def poll_loop():
         while True:
@@ -635,7 +680,7 @@ def main() -> int:
                 pass
 
     threading.Thread(target=poll_loop, daemon=True).start()
-    threading.Thread(target=vault_cache.serve, kwargs={"on_show": lambda: calls.put(lambda: secrets_window.show(by_user=False))}, daemon=True).start()
+    threading.Thread(target=vault_cache.serve, kwargs={"on_show": lambda: calls.put(lambda: secrets_window.show(by_user=False)), "on_run": on_run}, daemon=True).start()
     root.after(100, pump)
     root.mainloop()
     k32.CloseHandle(mutex)

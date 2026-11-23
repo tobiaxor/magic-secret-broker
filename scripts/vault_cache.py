@@ -160,7 +160,8 @@ class Cache:
 
     def lookup(self, name: str) -> dict:
         hours = cache_hours()
-        if not hours:
+        # With a Hello-protected password an entry leaves the tray only through `run`, which asks for approval.
+        if not hours or sb.protected():
             self.clear()
             return {"ok": False, "reason": "off"}
         with self.lock:
@@ -185,7 +186,7 @@ class Cache:
                     "entries": len(self.entries) if self.entries is not None else 0}
 
 
-def _handle(cache: Cache, raw: bytes, on_show=None) -> dict:
+def _handle(cache: Cache, raw: bytes, on_show=None, on_run=None) -> dict:
     try:
         req = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -201,11 +202,14 @@ def _handle(cache: Cache, raw: bytes, on_show=None) -> dict:
     if op == "show" and on_show is not None:
         on_show()
         return {"ok": True}
+    if op == "run" and on_run is not None and isinstance(req.get("argv"), list) and isinstance(req.get("cwd"), str):
+        return on_run(req)
     return {"ok": False, "reason": "bad request"}
 
 
-def serve(stop: threading.Event | None = None, on_show=None) -> None:
-    """Blocking server loop; the tray runs it in a daemon thread."""
+def serve(stop: threading.Event | None = None, on_show=None, on_run=None) -> None:
+    """Blocking server loop; the tray runs it in a daemon thread. Each client gets its own thread: a `run` can wait minutes
+    for the user, and `show` or `status` must still be answered meanwhile."""
     cache = Cache()
     sa = _user_only_sa()
 
@@ -224,24 +228,29 @@ def serve(stop: threading.Event | None = None, on_show=None) -> None:
             # Another process already owns the name (a second tray, or a squatter): serve nothing.
             return
         first = False
-        try:
-            if not _k32.ConnectNamedPipe(h, None) and ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
-                continue
-            buf = ctypes.create_string_buffer(MAX_MSG)
-            got = wintypes.DWORD()
-            if not _k32.ReadFile(h, ctypes.cast(buf, ctypes.c_void_p), MAX_MSG, ctypes.byref(got), None):
-                continue
-            try:
-                resp = _handle(cache, buf.raw[:got.value], on_show)
-            except Exception as e:  # noqa: BLE001 - one bad request must not stop the server
-                resp = {"ok": False, "reason": "error", "detail": type(e).__name__}
-            data = json.dumps(resp, ensure_ascii=False).encode("utf-8")
-            written = wintypes.DWORD()
-            _k32.WriteFile(h, ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p), len(data), ctypes.byref(written), None)
-            _k32.FlushFileBuffers(h)
-        finally:
-            _k32.DisconnectNamedPipe(h)
+        if not _k32.ConnectNamedPipe(h, None) and ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
             _k32.CloseHandle(h)
+            continue
+        threading.Thread(target=_answer, args=(h, cache, on_show, on_run), daemon=True).start()
+
+
+def _answer(h, cache: Cache, on_show, on_run) -> None:
+    try:
+        buf = ctypes.create_string_buffer(MAX_MSG)
+        got = wintypes.DWORD()
+        if not _k32.ReadFile(h, ctypes.cast(buf, ctypes.c_void_p), MAX_MSG, ctypes.byref(got), None):
+            return
+        try:
+            resp = _handle(cache, buf.raw[:got.value], on_show, on_run)
+        except Exception as e:  # noqa: BLE001 - one bad request must not stop the server
+            resp = {"ok": False, "reason": "error", "detail": type(e).__name__}
+        data = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        written = wintypes.DWORD()
+        _k32.WriteFile(h, ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p), len(data), ctypes.byref(written), None)
+        _k32.FlushFileBuffers(h)
+    finally:
+        _k32.DisconnectNamedPipe(h)
+        _k32.CloseHandle(h)
 
 
 def request(payload: dict) -> dict | None:

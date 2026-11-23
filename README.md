@@ -104,6 +104,16 @@ Every `get` opens the vault: start Python, decrypt the file and parse its XML (a
 
 The cache reloads when the `.kdbx` file changes, drops the values once the chosen time has passed since they were loaded, and empties at once when you pick **Off**. It is off by default. It can be turned on or lengthened only from the tray menu: `secret-broker cache off` and `clear` are allowed from the command line, because they only tighten it. If the tray is not running or the vault is locked, `get` opens the vault itself as before.
 
+### Master password protected by Windows Hello
+
+By default the remembered master password sits in Windows Credential Manager, where any program running as you can read it. Tick **Master password protected by Windows Hello** in the tray menu to encrypt it with a Windows Hello key instead (fingerprint, face or PIN; Windows asks up to three times while turning it on, and the plain copy is deleted only after a second prompt reproduced the key). After that:
+
+- the tray is the only process that opens the vault. Windows asks for Hello once, at the first use after the tray starts; the unlocked session then lasts until the tray exits (normally until you sign out or restart the computer);
+- `list`, `get`, `set`, `ask`, `delete` and `forget` are sent to the tray through its pipe. The tray runs the same checks, shows the same approval windows and writes the same audit log, and returns only what the command would print. The pipe no longer hands out entries on its own, and the vault cache setting has no effect;
+- the Secrets window unlocks through the same Hello key, or with the master password typed by hand, which also unlocks the tray for the session.
+
+Untick the menu item (one more Hello prompt) to move the password back to Credential Manager. Know your master password before turning this on: if Windows Hello is reset (new PIN container, cleared TPM), the remembered copy cannot be decrypted any more.
+
 ### `no-file` secrets
 
 Tag an entry `no-file` (the checkbox in the Secrets window's editor or in the `set`/`ask` windows) when its value must never be written to a file. `get` refuses to redirect it to a file (exit 4) and the `guard-hook` subcommand, installed as a Claude Code `PreToolUse` hook (matcher `Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell`), blocks file writes and redirecting shell commands that contain such a value. The hook stores only HMACs of values it has seen. Writes to the temp folder and to git-ignored files inside a temporary linked worktree are allowed.
@@ -138,13 +148,13 @@ secret-broker protects against a **well-meaning but mistaken agent**: it keeps s
 
 It is **not** a security boundary against an agent that runs arbitrary commands as your Windows user, for example after a prompt injection. Such a process can:
 
-- read the remembered master password from Windows Credential Manager and open the vault directly, with no window and no log entry;
+- read the remembered master password from Windows Credential Manager and open the vault directly, with no window and no log entry (not when the password is protected by Windows Hello: the process then needs you to pass a Hello prompt, or it has to go through the tray's approval);
 - edit the approval, settings and audit files, run from another project's directory, or click the approval window;
 - send keystrokes to an unlocked Secrets window (select an entry, copy) and read the clipboard; the log then shows the copy as made by you. It cannot unlock the window that way where Windows Hello is set up, but Hello guards the window only, not the remembered password itself;
 - stop or impersonate the tray icon, or replace the broker's scripts, venv or shims;
-- ask the vault cache's pipe for any entry while the cache is on, or, with administrator rights, read the decrypted values (and, while the Secrets window is unlocked, the master password) from the tray's memory.
+- ask the vault cache's pipe for any entry while the cache is on (not with Hello protection), or, with administrator rights, read the decrypted values (and, while the Secrets window is unlocked, the master password) from the tray's memory.
 
-The tray denies other processes of your user access to its memory (read, write, debug, thread injection) and restarts itself outside the venv launcher, which would otherwise keep an open handle to it. That closes one door only: it matters mostly when the master password is **not** remembered in Credential Manager, and Python cannot wipe a secret from memory after use, so values may linger in the tray until it exits.
+The tray denies other processes of your user access to its memory (read, write, debug, thread injection) and restarts itself outside the venv launcher, which would otherwise keep an open handle to it. That closes one door only: it matters when the master password is protected by Windows Hello or not remembered at all, and Python cannot wipe a secret from memory after use, so values may linger in the tray until it exits.
 
 The audit log and notifications are informational, not tamper-proof. `no-file` is a lint for mistakes: encoded, split or indirect writes are not detected. Approvals cover a whole entry (all its fields), not a single field. The reason text comes from the agent; read it critically, and never type your master password into an `ask` window.
 

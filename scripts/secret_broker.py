@@ -83,6 +83,13 @@ DIALOG_TIMEOUT_S = 180
 
 STANDARD_FIELDS = {"password": "password", "username": "username", "url": "url", "notes": "notes"}
 
+# Set only inside the tray. With a Hello-protected password the tray is the one process that opens the vault and asks
+# for approval; a command then runs there with the caller's cwd, stdin and stdout details in REMOTE.
+VAULT_PROVIDER = None
+DIALOG_PARENT = None
+REMOTE: dict | None = None
+FORWARDED = ("list", "get", "set", "ask", "delete", "forget")
+
 EXIT_DENIED = 1
 EXIT_NOT_FOUND = 2
 EXIT_LOCKED = 3
@@ -117,7 +124,7 @@ class _Dialog:
             pass
         self.tk = tk
         self.t = THEMES[theme]
-        self.root = root = tk.Tk()
+        self.root = root = tk.Toplevel(DIALOG_PARENT) if DIALOG_PARENT is not None else tk.Tk()
         root.withdraw()
         # Tk scales fonts with DPI but not pixel paddings.
         self.scale = max(1.0, float(root.tk.call("tk", "scaling")) / (96 / 72))
@@ -125,7 +132,7 @@ class _Dialog:
         root.configure(bg=BG)
         root.resizable(False, False)
         root.attributes("-topmost", True)
-        root.after(DIALOG_TIMEOUT_S * 1000, root.destroy)
+        root.after(DIALOG_TIMEOUT_S * 1000, lambda: root.winfo_exists() and root.destroy())
 
         a = self.t["accent"]
         head = tk.Frame(root, bg=a, padx=self.px(20), pady=self.px(16))
@@ -216,7 +223,10 @@ class _Dialog:
         root.lift()
         root.focus_force()
         focus.focus_set()
-        root.mainloop()
+        if DIALOG_PARENT is not None:
+            root.wait_window()
+        else:
+            root.mainloop()
 
 
 def dialog_approve(secret: str, field: str, project: str, reason: str, no_file: bool = False) -> tuple[str, str]:
@@ -590,6 +600,15 @@ _advapi.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD
 _advapi.CredFree.argtypes = [ctypes.c_void_p]
 
 
+def hello_user() -> str:
+    return f"{KDBX_PATH}#hello"
+
+
+def protected() -> bool:
+    """The remembered master password is encrypted with a Windows Hello key instead of lying readable in Credential Manager."""
+    return _kr_get(hello_user()) is not None
+
+
 def _target(user: str) -> str:
     return f"{KEYRING_SERVICE}:{user}"
 
@@ -631,6 +650,8 @@ def open_vault(project: str | None = None, for_write: bool = False, interactive:
 
     if not KDBX_PATH.exists():
         raise Locked(tr("Vault file not found: {path}. Create it with: secret-broker init", path=KDBX_PATH))
+    if VAULT_PROVIDER is not None and protected():
+        return VAULT_PROVIDER(for_write)
 
     pw_user = str(KDBX_PATH)
     tk_user = f"{KDBX_PATH}#transformed_key"
@@ -868,7 +889,17 @@ def in_linked_worktree(d: Path) -> bool:
         return False
 
 
+def _cwd() -> str:
+    return REMOTE["cwd"] if REMOTE is not None else os.getcwd()
+
+
+def _tty() -> bool:
+    return REMOTE["tty"] if REMOTE is not None else sys.stdout.isatty()
+
+
 def _stdout_file() -> str | None:
+    if REMOTE is not None:
+        return REMOTE["stdout_file"]
     try:
         fd = sys.stdout.fileno()
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -1188,7 +1219,7 @@ def refuse(msg: str, comment: str) -> int:
 
 
 def cmd_list(args) -> int:
-    project = project_root(os.getcwd())
+    project = project_root(_cwd())
     try:
         entries = vault_entries(open_vault(project))
     except Locked as e:
@@ -1209,9 +1240,9 @@ def cmd_list(args) -> int:
 
 
 def cmd_get(args) -> int:
-    project = project_root(os.getcwd())
+    project = project_root(_cwd())
     import vault_cache
-    hit, entry = vault_cache.cached_entry(args.name)
+    hit, entry = (False, None) if VAULT_PROVIDER is not None else vault_cache.cached_entry(args.name)
     if not hit:
         try:
             entry = vault_entries(open_vault(project)).get(args.name)
@@ -1247,7 +1278,7 @@ def cmd_get(args) -> int:
         remember_no_file(value=(args.name, value))
         print(tr("NOTE: '{name}' is tagged {tag}. Keep it only in a variable/process; do not write it to .env, configs, scripts or other files (exception: a git-ignored file in a temporary worktree).", name=args.name, tag=NO_FILE_TAG), file=sys.stderr)
     sys.stdout.write(value)
-    if sys.stdout.isatty():
+    if _tty():
         sys.stdout.write("\n")
     return 0
 
@@ -1276,7 +1307,7 @@ def cmd_set(args) -> int:
     if args.generate:
         changes.append({"field": args.field, "value": generate_password(args.generate), "sensitive": True})
     elif args.stdin:
-        value = sys.stdin.buffer.read().decode("utf-8")
+        value = (REMOTE["stdin"] if REMOTE is not None else sys.stdin.buffer.read()).decode("utf-8")
         if "\n" not in value.rstrip("\r\n"):
             value = value.rstrip("\r\n")
         if not value:
@@ -1301,7 +1332,7 @@ def cmd_set(args) -> int:
             return fail(tr("set --generate --no-file may not write to a file ({target}). Keep the value in a variable.", target=target), EXIT_FORBIDDEN)
 
     name = "/".join(parts)
-    project = project_root(os.getcwd())
+    project = project_root(_cwd())
     try:
         with file_lock("vault", DIALOG_TIMEOUT_S + 30):
             return _set_locked(args, parts, name, project, changes)
@@ -1358,7 +1389,7 @@ def _set_locked(args, parts, name, project, changes) -> int:
           + (f" [{', '.join(extras)}]" if extras else "") + ".", file=sys.stderr)
     if args.generate:
         sys.stdout.write(changes[0]["value"])
-        if sys.stdout.isatty():
+        if _tty():
             sys.stdout.write("\n")
     return 0
 
@@ -1387,7 +1418,7 @@ def cmd_ask(args) -> int:
             return fail(tr("ask --print may not write to a file ({target}). Keep the value in a variable.", target=target), EXIT_FORBIDDEN)
 
     name = "/".join(parts)
-    project = project_root(os.getcwd())
+    project = project_root(_cwd())
     try:
         with file_lock("vault", DIALOG_TIMEOUT_S + 30):
             return _ask_locked(args, parts, name, project, fields, attrs)
@@ -1438,7 +1469,7 @@ def _ask_locked(args, parts, name, project, fields, attrs) -> int:
         remember_no_file(names=sorted(set(load_no_file()["names"]) | {name}), value=(name, res["values"][fields[0]]) if args.print else None)
     if args.print:
         sys.stdout.write(res["values"][fields[0]])
-        if sys.stdout.isatty():
+        if _tty():
             sys.stdout.write("\n")
     return 0
 
@@ -1466,7 +1497,7 @@ def cmd_approvals(args) -> int:
     data = load_approvals()
     day = load_day_approvals()
     if args.revoke:
-        project = project_root(args.project or os.getcwd())
+        project = project_root(args.project or _cwd())
         revoke(project, args.revoke)
         audit(project=project, secret=args.revoke, action="revoke", decision="revoked")
         data, day = load_approvals(), load_day_approvals()
@@ -1477,7 +1508,7 @@ def cmd_approvals(args) -> int:
 
 def cmd_mode(args) -> int:
     if args.mode:
-        project = None if args.globally else project_root(args.project or os.getcwd())
+        project = None if args.globally else project_root(args.project or _cwd())
         new = None if args.mode == "default" else args.mode
         before = load_settings()
         key = "write_" if args.write else ""
@@ -1494,7 +1525,7 @@ def cmd_mode(args) -> int:
         if loosens:
             ensure_tray()
     data = load_settings()
-    here = project_root(args.project or os.getcwd())
+    here = project_root(args.project or _cwd())
     print(json.dumps({**data, "current_project": here, "current_mode": project_mode(here),
                       "current_write_mode": project_mode(here, True)}, indent=2, ensure_ascii=False))
     return 0
@@ -1533,11 +1564,11 @@ def cmd_tray(_args) -> int:
 
 
 def cmd_forget(args) -> int:
-    users = (str(KDBX_PATH), f"{KDBX_PATH}#transformed_key")
+    users = (str(KDBX_PATH), f"{KDBX_PATH}#transformed_key", hello_user())
     if all(_kr_get(u) is None for u in users):
         print(tr("Nothing is remembered."))
         return 0
-    project = project_root(os.getcwd())
+    project = project_root(_cwd())
     ok, comment = dialog_forget(str(KDBX_PATH), project, args.reason)
     audit(project=project, action="forget", decision="ok" if ok else "deny", reason=args.reason, comment=comment)
     if not ok:
@@ -1551,7 +1582,7 @@ def cmd_forget(args) -> int:
 def cmd_delete(args) -> int:
     """Always asks in a window: neither notify mode nor a standing approval covers destroying an entry."""
     name = "/".join(p for p in args.name.split("/") if p)
-    project = project_root(os.getcwd())
+    project = project_root(_cwd())
     try:
         with file_lock("vault", DIALOG_TIMEOUT_S + 30):
             kp = open_vault(project, for_write=True)
@@ -1643,12 +1674,27 @@ def _drop_own_console() -> None:
         setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
 
 
-def main(argv: list[str] | None = None) -> int:
-    _drop_own_console()
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+def _forward(argv: list[str], cmd: str, with_stdin: bool) -> int:
+    """The tray holds the vault: it runs the command, shows the windows and sends back what to print."""
+    import vault_cache
+    if not ensure_tray(10):
+        return fail(tr("The tray did not start."), EXIT_LOCKED)
+    req = {"op": "run", "argv": argv, "cwd": os.getcwd(), "tty": sys.stdout.isatty(), "stdout_file": _stdout_file(),
+           "stdin": base64.b64encode(sys.stdin.buffer.read()).decode() if with_stdin else ""}
+    deadline = time.time() + 10
+    while True:
+        resp = vault_cache.request(req)
+        if resp is not None or time.time() > deadline:
+            break
+        time.sleep(0.2)
+    if not resp or not resp.get("ok"):
+        return fail(tr("The tray did not answer."), EXIT_LOCKED)
+    sys.stderr.write(resp.get("err", ""))
+    sys.stdout.write(resp.get("out", ""))
+    return int(resp.get("code", EXIT_LOCKED))
 
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="secret-broker", description=tr("Vault: {path}", path=KDBX_PATH))
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_list = sub.add_parser("list", help=tr("secret and field names (no values)"))
@@ -1697,8 +1743,23 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("open", help=tr("open the Secrets window (browse, edit, unlock the vault)"))
     sub.add_parser("tray", help=tr("tray icon: mode, history, approvals"))
     sub.add_parser("guard-hook", help=tr("Claude Code PreToolUse hook: blocks writing no-file secrets to files"))
-    args = parser.parse_args(argv)
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    _drop_own_console()
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+    argv = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(argv)
+    if args.cmd in FORWARDED and VAULT_PROVIDER is None and protected():
+        return _forward(argv, args.cmd, args.cmd == "set" and args.stdin)
+    return run(args)
+
+
+def run(args) -> int:
     return {"list": cmd_list, "get": cmd_get, "set": cmd_set, "ask": cmd_ask, "init": cmd_init, "approvals": cmd_approvals, "forget": cmd_forget, "delete": cmd_delete,
             "mode": cmd_mode, "cache": cmd_cache, "open": cmd_open, "tray": cmd_tray, "guard-hook": cmd_guard_hook}[args.cmd](args)
 

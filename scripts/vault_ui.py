@@ -7,6 +7,7 @@ from ctypes import wintypes
 from datetime import datetime
 
 import hello
+import keeper
 import secret_broker as sb
 import vault_cache
 from secret_broker import tr
@@ -144,7 +145,7 @@ class Session:
 
     @staticmethod
     def remembered() -> bool:
-        return sb._kr_get(str(sb.KDBX_PATH)) is not None
+        return sb._kr_get(str(sb.KDBX_PATH)) is not None or sb.protected()
 
     @staticmethod
     def remember(kp, password: str) -> None:
@@ -153,19 +154,30 @@ class Session:
 
     def unlock(self, password: str, remember: bool) -> None:
         self._load(password)
-        if remember:
+        if sb.protected():
+            keeper.KEEPER.adopt(password, remember)
+        elif remember:
             self.remember(self.kp, password)
 
     def unlock_remembered(self) -> bool:
+        """With a Hello-protected password this is where Windows asks for the fingerprint, face or PIN."""
         from pykeepass.exceptions import CredentialsError
 
-        pw = sb._kr_get(str(sb.KDBX_PATH))
-        if pw is None or not sb.KDBX_PATH.exists():
+        if not sb.KDBX_PATH.exists():
+            return False
+        if sb.protected():
+            pw = keeper.KEEPER.password if keeper.KEEPER.unlock() else None
+        else:
+            pw = sb._kr_get(str(sb.KDBX_PATH))
+        if pw is None:
             return False
         try:
             self._load(pw)
         except CredentialsError:
-            sb._kr_del(str(sb.KDBX_PATH))
+            if sb.protected():
+                keeper.KEEPER.lock()
+            else:
+                sb._kr_del(str(sb.KDBX_PATH))
             return False
         return True
 
@@ -202,6 +214,9 @@ class Session:
         """
         if self.password is None:
             raise Busy(tr("The vault is locked"))
+        # An agent's command runs on this very thread, so the vault lock would let us straight through.
+        if sb.REMOTE is not None:
+            raise Busy(tr("The vault is busy: a window from an agent is open. Close it and try again."))
         try:
             lock = sb.file_lock("vault", 3)
             lock.__enter__()
@@ -309,6 +324,9 @@ class SecretsWindow:
         """Where Windows Hello is set up, the remembered password opens the window only after Hello confirms the person."""
         if self.hello_op is not None or self.session.unlocked:
             return
+        if sb.protected() and not keeper.KEEPER.unlocked:
+            # Decrypting the password is itself a Hello prompt; a second one for the window would be noise.
+            return self._unlock_remembered(True)
         if not hello.available():
             return self._unlock_remembered(False)
         self.hello_op = hello.request(_u32.GetParent(self.win.winfo_id()), tr("Unlock the Secrets window"))
@@ -339,7 +357,8 @@ class SecretsWindow:
         except Exception as e:  # noqa: BLE001 - a broken vault file must still show the window with the error
             return self.status(str(e))
         if not opened:
-            return self.status(tr("The remembered password no longer opens the vault."))
+            return self.status(tr("Windows Hello did not confirm it is you. Enter the master password.") if sb.protected()
+                               else tr("The remembered password no longer opens the vault."))
         sb.audit(action="unlock", vault=str(sb.KDBX_PATH), decision="ok-tray", remembered=True, hello=confirmed)
         self.render()
 
@@ -542,6 +561,8 @@ class SecretsWindow:
             return
         sb._kr_del(str(sb.KDBX_PATH))
         sb._kr_del(_tk_user())
+        if sb.protected():
+            keeper.KEEPER.forget()
         vault_cache.request({"op": "clear"})
         sb.audit(action="forget", decision="ok-tray")
         self.lock()
