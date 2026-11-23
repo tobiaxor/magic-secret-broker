@@ -41,6 +41,20 @@ warnings = []
 messagebox.showwarning = lambda title, msg, **k: warnings.append(msg)
 messagebox.showerror = lambda title, msg, **k: warnings.append(msg)
 
+ui.hello.available = lambda: False
+
+
+class Prompt:
+    def __init__(self, result):
+        self.result = result
+
+    def poll(self):
+        return self.result
+
+    def cancel(self):
+        pass
+
+
 root = tk.Tk()
 root.withdraw()
 w = ui.SecretsWindow(root)
@@ -198,6 +212,20 @@ try:
     try:
         w.show(by_user=False)
         check("open from the CLI shows it locked", not w.session.unlocked)
+        asked = []
+        ui.hello.available = lambda: True
+        ui.hello.request = lambda hwnd, msg: asked.append(msg) or Prompt(6)
+        w.close()
+        w.show()
+        check("Hello refused: stays locked", asked and not w.session.unlocked)
+        ui.hello.request = lambda hwnd, msg: Prompt(ui.hello.VERIFIED)
+        w.use_remembered()
+        check("Hello confirmed: unlocked", w.session.unlocked)
+        w.lock()
+        ui.hello.available = lambda: False
+        w.use_remembered()
+        check("no Hello on this PC: the remembered password still unlocks", w.session.unlocked)
+        w.lock()
     finally:
         sb._kr_del(str(sb.KDBX_PATH))
     w.session.unlock(PW, remember=False)

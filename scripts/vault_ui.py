@@ -6,6 +6,7 @@ import time
 from ctypes import wintypes
 from datetime import datetime
 
+import hello
 import secret_broker as sb
 import vault_cache
 from secret_broker import tr
@@ -275,6 +276,7 @@ class SecretsWindow:
         self.session = Session()
         self.clip_seq = None
         self.clip_after = None
+        self.hello_op = None
         self.last_activity = time.time()
         self.dialogs = 0
         self.modals: list = []
@@ -298,14 +300,48 @@ class SecretsWindow:
             self._reload_if_changed()
             return
         self.build()
-        if by_user and not self.session.unlocked:
-            try:
-                if self.session.unlock_remembered():
-                    sb.audit(action="unlock", vault=str(sb.KDBX_PATH), decision="ok-tray", remembered=True)
-            except Exception as e:  # noqa: BLE001 - a broken vault file must still show the window with the error
-                self.status(str(e))
         self.render()
+        if by_user and not self.session.unlocked and sb.KDBX_PATH.exists() and Session.remembered():
+            self.use_remembered()
         self.win.after(TICK_MS, self._tick)
+
+    def use_remembered(self) -> None:
+        """Where Windows Hello is set up, the remembered password opens the window only after Hello confirms the person."""
+        if self.hello_op is not None or self.session.unlocked:
+            return
+        if not hello.available():
+            return self._unlock_remembered(False)
+        self.hello_op = hello.request(_u32.GetParent(self.win.winfo_id()), tr("Unlock the Secrets window"))
+        self.status(tr("Waiting for Windows Hello…"))
+        self._hello_poll()
+
+    def _hello_poll(self) -> None:
+        op = self.hello_op
+        if op is None:
+            return
+        if self.win is None or not self.win.winfo_exists() or self.session.unlocked:
+            op.cancel()
+            self.hello_op = None
+            return
+        result = op.poll()
+        if result is None:
+            self.win.after(150, self._hello_poll)
+            return
+        self.hello_op = None
+        if result == hello.VERIFIED:
+            self._unlock_remembered(True)
+        else:
+            self.status(tr("Windows Hello did not confirm it is you. Enter the master password."))
+
+    def _unlock_remembered(self, confirmed: bool) -> None:
+        try:
+            opened = self.session.unlock_remembered()
+        except Exception as e:  # noqa: BLE001 - a broken vault file must still show the window with the error
+            return self.status(str(e))
+        if not opened:
+            return self.status(tr("The remembered password no longer opens the vault."))
+        sb.audit(action="unlock", vault=str(sb.KDBX_PATH), decision="ok-tray", remembered=True, hello=confirmed)
+        self.render()
 
     def build(self) -> None:
         tk, ttk = self.tk, self.ttk
@@ -350,6 +386,9 @@ class SecretsWindow:
         w.bind("<Control-e>", lambda _e: self.edit_selected())
 
     def close(self) -> None:
+        if self.hello_op is not None:
+            self.hello_op.cancel()
+            self.hello_op = None
         self.lock(render=False)
         self.win.destroy()
         self.win = None
@@ -489,14 +528,7 @@ class SecretsWindow:
         row.pack(fill="x", pady=(self.px(10), 0))
         self._primary(row, label, action).pack(side="left")
         if sb.KDBX_PATH.exists() and Session.remembered():
-            def remembered():
-                if self.session.unlock_remembered():
-                    sb.audit(action="unlock", vault=str(sb.KDBX_PATH), decision="ok-tray", remembered=True)
-                    self.render()
-                else:
-                    error.set(tr("The remembered password no longer opens the vault."))
-
-            self._link(row, tr("Use the remembered password"), remembered).pack(side="left", padx=(self.px(14), 0))
+            self._link(row, tr("Use the remembered password"), self.use_remembered).pack(side="left", padx=(self.px(14), 0))
             self._link(box, tr("Forget the remembered password"), self.forget_remembered, fg=sb.THEMES["forget"]["hover"]
                        ).pack(anchor="w", pady=(self.px(14), 0))
         first.bind("<Return>", lambda _e: action())
