@@ -32,6 +32,7 @@ for _fn, _args, _res in (
     (_k32.GlobalUnlock, [ctypes.c_void_p], wintypes.BOOL),
     (_k32.GlobalFree, [ctypes.c_void_p], ctypes.c_void_p),
     (_u32.GetParent, [wintypes.HWND], wintypes.HWND),
+    (_u32.EnableWindow, [wintypes.HWND, wintypes.BOOL], wintypes.BOOL),
     (_u32.SetWindowDisplayAffinity, [wintypes.HWND, wintypes.DWORD], wintypes.BOOL),
 ):
     _fn.argtypes, _fn.restype = _args, _res
@@ -350,17 +351,31 @@ class SecretsWindow:
             self._unlock_remembered(True)
         else:
             self.status(tr("Windows Hello did not confirm it is you. Enter the master password."))
+            self._regain_focus()
+
+    def _regain_focus(self) -> None:
+        """The Hello prompt disables its owner window and Tk comes back from it with no focus at all, so nothing can be typed."""
+        if self.win is None or not self.win.winfo_exists():
+            return
+        _u32.EnableWindow(_u32.GetParent(self.win.winfo_id()), True)
+        self.win.focus_force()
+        field = getattr(self, "first_field", None)
+        if field is not None and field.winfo_exists():
+            field.focus_set()
 
     def _unlock_remembered(self, confirmed: bool) -> None:
         try:
             opened = self.session.unlock_remembered()
         except Exception as e:  # noqa: BLE001 - a broken vault file must still show the window with the error
+            self._regain_focus()
             return self.status(str(e))
         if not opened:
+            self._regain_focus()
             return self.status(tr("Windows Hello did not confirm it is you. Enter the master password.") if sb.protected()
                                else tr("The remembered password no longer opens the vault."))
         sb.audit(action="unlock", vault=str(sb.KDBX_PATH), decision="ok-tray", remembered=True, hello=confirmed)
         self.render()
+        self._regain_focus()
 
     def build(self) -> None:
         tk, ttk = self.tk, self.ttk
@@ -552,6 +567,7 @@ class SecretsWindow:
                        ).pack(anchor="w", pady=(self.px(14), 0))
         first.bind("<Return>", lambda _e: action())
         first.focus_set()
+        self.first_field = first
 
     def forget_remembered(self) -> None:
         from tkinter import messagebox
